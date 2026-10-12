@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "core/published_view.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "rules/column_hider.hpp"
@@ -24,7 +25,7 @@ namespace duckdb {
 void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
 	auto catalog = view_catalog;
 	if (catalog.empty()) {
-		catalog = ClientData::Get(context).catalog_search_path->GetDefault().catalog;
+		catalog = ClientData::Get(context).catalog_search_path->GetDefault().GetCatalog().GetIdentifierName();
 	}
 	string target = SqlUtils::QuoteIdentifier(DEFAULT_SCHEMA);
 	if (!catalog.empty()) {
@@ -54,28 +55,30 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 	auto catalog = current->GetValue(0, 0).ToString();
 	for (auto name :
 	     {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::MV_DEPS_TABLE, "openivm_refresh_hooks"}) {
-		auto entry =
-		    Catalog::GetEntry<TableCatalogEntry>(context, catalog, DEFAULT_SCHEMA, name, OnEntryNotFound::RETURN_NULL);
+		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+		                       QualifiedName(Identifier(catalog), Identifier(DEFAULT_SCHEMA), Identifier(name)));
+		auto entry = Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 		if (!entry) {
 			continue;
 		}
+		auto &table_entry = entry->Cast<TableCatalogEntry>();
 		vector<StorageIndex> column_ids;
 		vector<string> columns;
-		for (auto &column : entry->GetColumns().Physical()) {
+		for (auto &column : table_entry.GetColumns().Physical()) {
 			column_ids.emplace_back(column.StorageOid());
-			columns.push_back(SqlUtils::QuoteIdentifier(column.Name()) + " " + column.Type().ToString());
+			columns.push_back(SqlUtils::QuoteIdentifier(column.Name().GetIdentifierName()) + " " + column.Type().ToString());
 		}
 		auto created = con.Query("CREATE OR REPLACE TEMP TABLE " + SqlUtils::QuoteIdentifier(name) + " (" +
 		                         StringUtil::Join(columns, ", ") + ")");
 		if (created->HasError()) {
 			throw CatalogException("Cannot snapshot transaction metadata: %s", created->GetError());
 		}
-		auto &transaction = DuckTransaction::Get(context, entry->catalog);
-		auto &storage = entry->GetStorage();
+		auto &transaction = DuckTransaction::Get(context, table_entry.catalog);
+		auto &storage = table_entry.GetStorage();
 		TableScanState scan;
 		storage.InitializeScan(context, transaction, scan, column_ids);
 		DataChunk rows;
-		rows.Initialize(Allocator::Get(context), entry->GetTypes());
+		rows.Initialize(Allocator::Get(context), table_entry.GetTypes());
 		Appender appender(con, TEMP_CATALOG, DEFAULT_SCHEMA, name);
 		while (true) {
 			rows.Reset();
@@ -287,7 +290,7 @@ vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
 	vector<string> catalogs;
 	for (idx_t row = 0; row < rows->RowCount(); row++) {
 		auto catalog = rows->GetValue(0, row).ToString();
-		if (con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE)) {
+		if (con.TableInfo(Identifier(catalog), Identifier(DEFAULT_SCHEMA), Identifier(openivm::DELTA_TABLES_TABLE))) {
 			catalogs.push_back(std::move(catalog));
 		}
 	}
@@ -723,7 +726,7 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 	string query;
 	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
 		auto catalog = catalogs->GetValue(0, row).ToString();
-		if (!con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE)) {
+		if (!con.TableInfo(Identifier(catalog), Identifier(DEFAULT_SCHEMA), Identifier(openivm::VIEWS_TABLE))) {
 			continue;
 		}
 		auto catalog_literal = "'" + SqlUtils::EscapeValue(catalog) + "'";

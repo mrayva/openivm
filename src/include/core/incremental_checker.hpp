@@ -32,6 +32,7 @@ struct PlanAnalysis {
 	bool found_nested_aggregate = false; // outer aggregate over inner aggregate (CTE re-agg); COUNT(*) in outer is
 	                                     // non-linear over source deltas → group-recompute
 	bool found_volatile_expression = false;
+	bool found_unnest = false;
 	bool found_non_foldable_unnest = false;
 	bool found_unsupported_aggregate = false;
 	bool found_unsupported_filtered_aggregate = false;

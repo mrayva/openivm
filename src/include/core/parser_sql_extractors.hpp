@@ -17,6 +17,7 @@ struct SemiAntiExtract {
 	string left_key_col;
 	string left_key_expr;
 	string right_key_expr;
+	bool is_exists_subquery = false;
 	bool null_aware = false;
 	string null_aware_left_col;
 	string null_aware_left_expr;

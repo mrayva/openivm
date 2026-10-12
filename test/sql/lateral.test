@@ -232,7 +232,7 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# Row-local UNNEST over base columns is a linear lateral expansion.
+# Row-local UNNEST over base columns is maintained via affected-key recompute on this tip.
 statement ok
 CREATE TABLE lat_unnest_stock (
     s_w_id INT,
@@ -274,6 +274,10 @@ statement ok
 UPDATE lat_unnest_stock SET d2 = 'yy', s_quantity = 9 WHERE s_i_id = 20;
 
 statement ok
+DELETE FROM lat_unnest_stock
+WHERE rowid = (SELECT min(rowid) FROM lat_unnest_stock WHERE s_i_id = 20);
+
+statement ok
 PRAGMA refresh('mv_lat_unnest_projection');
 
 query I
@@ -300,7 +304,50 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# Row-local UNNEST after a join should use the join delta terms and then expand each changed row.
+# A user-authored GROUP BY over UNNEST is not the delimiter-key scaffolding above.
+statement ok
+CREATE MATERIALIZED VIEW mv_lat_unnest_user_group AS
+    SELECT s.s_w_id, u.dist_info
+    FROM lat_unnest_stock s
+    CROSS JOIN UNNEST([s.d1, s.d2, s.d3]) AS u(dist_info)
+    WHERE s.s_quantity > 0
+    GROUP BY s.s_w_id, u.dist_info;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_lat_unnest_user_group';
+----
+6
+
+statement ok
+INSERT INTO lat_unnest_stock VALUES
+    (3, 31, 9, 'n1', 'n2', 'n3'),
+    (3, 32, 9, 'n1', 'n2', 'n3');
+
+statement ok
+PRAGMA refresh('mv_lat_unnest_user_group');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT * FROM mv_lat_unnest_user_group
+    EXCEPT ALL
+    SELECT s.s_w_id, u.dist_info
+    FROM lat_unnest_stock s
+    CROSS JOIN UNNEST([s.d1, s.d2, s.d3]) AS u(dist_info)
+    WHERE s.s_quantity > 0
+    GROUP BY s.s_w_id, u.dist_info
+    UNION ALL
+    SELECT s.s_w_id, u.dist_info
+    FROM lat_unnest_stock s
+    CROSS JOIN UNNEST([s.d1, s.d2, s.d3]) AS u(dist_info)
+    WHERE s.s_quantity > 0
+    GROUP BY s.s_w_id, u.dist_info
+    EXCEPT ALL
+    SELECT * FROM mv_lat_unnest_user_group
+);
+----
+0
+
+# Row-local UNNEST uses direct delta maintenance while preserving duplicate rows.
 statement ok
 CREATE TABLE lat_unnest_stock_agg (s_w_id INT, s_i_id INT, qty INT);
 
@@ -324,7 +371,7 @@ CREATE MATERIALIZED VIEW mv_lat_unnest_join_agg AS
 query I
 SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c61745f756e6e6573745f6a6f696e5f616767_';
 ----
-0
+6
 
 statement ok
 INSERT INTO lat_unnest_stock_agg VALUES (3, 30, 10);
@@ -558,7 +605,7 @@ SELECT COUNT(*) FROM (
 ----
 0
 
-# LATERAL table functions should keep original SQL for creation but still refresh incrementally.
+# LATERAL table functions use GROUP_RECOMPUTE on this tip and still refresh incrementally.
 statement ok
 CREATE TABLE lat_wh (w_id INT, w_name VARCHAR);
 
@@ -576,7 +623,7 @@ CREATE MATERIALIZED VIEW mv_lat_series AS
 query I
 SELECT type FROM openivm_views WHERE view_name = '__openivm_mv_6d656d6f7279_6d61696e_6d765f6c61745f736572696573_';
 ----
-2
+6
 
 statement ok
 INSERT INTO lat_wh VALUES (3, 'w3');

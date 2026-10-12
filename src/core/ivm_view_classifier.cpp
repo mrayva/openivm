@@ -40,11 +40,11 @@ static void DeduplicateGroupColumns(vector<string> &group_columns) {
 }
 
 static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		expr = cast.child.get();
+	while (expr && BoundCastExpression::IsCast(*expr)) {
+		auto &cast = expr->Cast<BoundFunctionExpression>();
+		expr = BoundCastExpression::ChildMutable(cast).get();
 	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return nullptr;
 	}
 	return &expr->Cast<BoundColumnRefExpression>();
@@ -52,8 +52,8 @@ static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
 
 static bool ResolvesToAggregateValueBinding(idx_t table_index, idx_t column_index, const CreateMVPlanFacts &facts) {
 	for (auto *aggregate : facts.aggregates) {
-		if (aggregate && aggregate->group_index == facts.analysis.group_index &&
-		    ResolvesToOutputBinding(table_index, column_index, aggregate->aggregate_index,
+		if (aggregate && aggregate->group_index.index == facts.analysis.group_index &&
+		    ResolvesToOutputBinding(table_index, column_index, aggregate->aggregate_index.index,
 		                            aggregate->expressions.size(), facts, true)) {
 			return true;
 		}
@@ -78,14 +78,15 @@ static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts
 	if (facts.root) {
 		if (output_idx < bindings.size()) {
 			auto &binding = bindings[output_idx];
-			return ResolvesToAggregateValueBinding(binding.table_index, binding.column_index, facts);
+			return ResolvesToAggregateValueBinding(binding.table_index.index, binding.column_index.GetIndexUnsafe(), facts);
 		}
 	}
 	if (!facts.first_projection || output_idx >= facts.first_projection->expressions.size()) {
 		return false;
 	}
 	auto *bcr = GetColumnRefThroughCasts(facts.first_projection->expressions[output_idx].get());
-	return bcr && ResolvesToAggregateValueBinding(bcr->binding.table_index, bcr->binding.column_index, facts);
+	return bcr && ResolvesToAggregateValueBinding(bcr->Binding().table_index.index,
+	                                            bcr->Binding().column_index.GetIndexUnsafe(), facts);
 }
 
 static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const vector<ColumnBinding> &bindings,
@@ -176,30 +177,30 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 
 	unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
 	for (auto &cond : cjoin->conditions) {
-		AddJoinKeyColumn(cond.left, join_key_cols);
-		AddJoinKeyColumn(cond.right, join_key_cols);
+		AddJoinKeyColumn(cond.LeftReference(), join_key_cols);
+		AddJoinKeyColumn(cond.RightReference(), join_key_cols);
 	}
 
 	auto &top_proj = *top_proj_ptr;
 	for (idx_t expr_i = 0; expr_i < top_proj.expressions.size(); expr_i++) {
 		auto &expr = top_proj.expressions[expr_i];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			continue;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		auto it = join_key_cols.find(bcr.binding.table_index);
-		if (it == join_key_cols.end() || !it->second.count(bcr.binding.column_index)) {
+		auto it = join_key_cols.find(bcr.Binding().table_index.index);
+		if (it == join_key_cols.end() || !it->second.count(bcr.Binding().column_index.GetIndexUnsafe())) {
 			continue;
 		}
 
 		string col_name;
-		if (!expr->alias.empty()) {
-			col_name = expr->alias;
+		if (expr->HasAlias()) {
+			col_name = expr->GetAlias().GetIdentifierName();
 		} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
 		           !IncrementalTableNames::IsInternalColumn(output_names[expr_i])) {
 			col_name = output_names[expr_i];
 		} else {
-			col_name = bcr.GetName();
+			col_name = bcr.GetName().GetIdentifierName();
 		}
 		if (IncrementalTableNames::IsInternalColumn(col_name)) {
 			continue;
@@ -359,6 +360,12 @@ static bool IsTransparentDistinctWrapper(LogicalOperatorType type) {
 	       type == LogicalOperatorType::LOGICAL_TOP_N;
 }
 
+static bool HasUnionDistinctSemantics(const PlanAnalysis &analysis, const CreateMVPlanFacts &facts,
+                                     bool distinct_at_top) {
+	return analysis.found_union_distinct ||
+	       (analysis.found_distinct && distinct_at_top && facts.has_union_before_aggregate);
+}
+
 static bool HasOuterProjectionOverDistinct(const CreateMVPlanFacts &facts) {
 	auto *node = facts.root;
 	bool found_projection = false;
@@ -378,13 +385,13 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 	const auto &analysis = facts.analysis;
 	const auto group_count = analysis.group_count;
 	const auto group_index = analysis.group_index;
+	const bool has_union_distinct = HasUnionDistinctSemantics(analysis, facts, model.distinct_at_top);
 	const bool has_union_over_agg = analysis.found_aggregation && facts.has_union_before_aggregate;
-	model.union_distinct_over_agg =
-	    has_union_over_agg && (analysis.found_union_distinct || (analysis.found_distinct && model.distinct_at_top));
+	model.union_distinct_over_agg = has_union_over_agg && has_union_distinct;
 
 	if (model.union_distinct_over_agg) {
 		model.group_columns = DeriveGroupColumnNames(facts, group_index, group_count, output_names);
-	} else if (analysis.found_union_distinct && !analysis.found_aggregation) {
+	} else if (has_union_distinct && !analysis.found_aggregation) {
 		AddVisibleGroupNames(model.group_columns, output_names);
 		if (!model.group_columns.empty()) {
 			AddUnique(model.strategy_reasons, DeltaStrategyReason::UNION_DISTINCT_GROUP_RECOMPUTE);
@@ -515,6 +522,7 @@ static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &fa
 }
 
 static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysis, const DeltaViewModelInput &input) {
+	const bool has_union_distinct = HasUnionDistinctSemantics(analysis, *input.facts, model.distinct_at_top);
 	const bool has_nonredundant_distinct =
 	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || input.facts->has_descendant_distinct);
 	auto has_argminmax =
@@ -557,7 +565,7 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		// to SUM(delta) is incorrect: a negative delta does not imply a negative new
 		// group total. Recompute only the affected groups from current base state.
 		model.type = RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_distinct && !analysis.found_union_distinct && model.distinct_at_top &&
+	} else if (analysis.found_distinct && !has_union_distinct && model.distinct_at_top &&
 	           analysis.found_aggregation) {
 		// DISTINCT over multiple aggregate result rows is a second non-linear
 		// aggregation level. The outer DISTINCT key is an aggregate value, not
@@ -571,7 +579,7 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		                                                                    : RefreshType::GROUP_RECOMPUTE;
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_union_distinct && !analysis.found_aggregation && !model.group_columns.empty()) {
+	} else if (has_union_distinct && !analysis.found_aggregation && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;

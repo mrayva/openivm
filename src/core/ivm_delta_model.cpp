@@ -69,7 +69,9 @@ static void AddExpressionNames(const vector<unique_ptr<Expression>> &expressions
 		if (!expr) {
 			continue;
 		}
-		AddOutputColumnName(expr->alias.empty() ? expr->GetName() : expr->alias, visible, hidden);
+		AddOutputColumnName(expr->HasAlias() ? expr->GetAlias().GetIdentifierName()
+		                                     : expr->GetName().GetIdentifierName(),
+		                    visible, hidden);
 	}
 }
 
@@ -366,14 +368,14 @@ static idx_t BuildModelNodeForPlan(DeltaViewModel &model, const CreateMVPlanNode
 	if (node.kind == DeltaModelNodeKind::SCAN) {
 		auto *get = dynamic_cast<LogicalGet *>(op);
 		if (get) {
-			auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
+			auto occurrence_it = facts.occurrence_by_index.find(get->table_index.index);
 			if (occurrence_it != facts.occurrence_by_index.end()) {
 				node.source_table = occurrence_it->second.table;
 				node.source_occurrence = occurrence_it->second.occurrence;
 				node.source_table_index = occurrence_it->second.table_index;
 				AddStringCI(node.source_tables, node.source_table);
 			}
-			SplitOutputColumns(get->names, node.output_columns, node.hidden_columns);
+			SplitOutputColumns(IdentifiersToStrings(get->names), node.output_columns, node.hidden_columns);
 		}
 	} else if (node.kind == DeltaModelNodeKind::PROJECT || node.kind == DeltaModelNodeKind::WINDOW ||
 	           node.kind == DeltaModelNodeKind::DISTINCT || node.kind == DeltaModelNodeKind::TOP_K) {

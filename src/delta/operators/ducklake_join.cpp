@@ -18,7 +18,6 @@
 #include "upsert/refresh_internal.hpp"
 
 #include <algorithm>
-
 namespace duckdb {
 
 struct DuckLakeJoinColumnRef {
@@ -61,7 +60,8 @@ static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo 
 		    column_ids[column_id_idx].IsVirtualColumn()) {
 			continue;
 		}
-		visible_columns[DeltaJoinBindingKey(bindings[output_idx])] = get->GetColumnName(column_ids[column_id_idx]);
+		visible_columns[DeltaJoinBindingKey(bindings[output_idx])] =
+		    get->GetColumnName(column_ids[column_id_idx]).GetIdentifierName();
 	}
 
 	auto record_visible = [&]() {
@@ -229,14 +229,14 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 		if (parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			auto &projection = parent->Cast<LogicalProjection>();
 			projection.expressions.push_back(make_uniq<BoundColumnRefExpression>(LogicalType::INTEGER, mul_binding));
-			mul_binding = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
+			mul_binding = ColumnBinding(projection.table_index, ProjectionIndex(projection.expressions.size() - 1));
 			continue;
 		}
 		if (parent->type == LogicalOperatorType::LOGICAL_FILTER) {
 			auto &filter = parent->Cast<LogicalFilter>();
 			if (!filter.projection_map.empty() && std::find(filter.projection_map.begin(), filter.projection_map.end(),
 			                                                mul_idx) == filter.projection_map.end()) {
-				filter.projection_map.push_back(mul_idx);
+				filter.projection_map.push_back(ProjectionIndex(mul_idx));
 			}
 			continue;
 		}
@@ -248,7 +248,7 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 			auto &projection_map = child_side == 0 ? join->left_projection_map : join->right_projection_map;
 			if (!projection_map.empty() &&
 			    std::find(projection_map.begin(), projection_map.end(), mul_idx) == projection_map.end()) {
-				projection_map.push_back(mul_idx);
+				projection_map.push_back(ProjectionIndex(mul_idx));
 			}
 			continue;
 		}
@@ -296,9 +296,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
 		D_ASSERT(get);
 		auto table_ref = get->GetTable();
-		string table_name = table_ref.get()->name;
-		table_catalogs[i] = table_ref->ParentCatalog().GetName();
-		table_schemas[i] = table_ref->schema.name;
+		string table_name = table_ref.get()->name.GetIdentifierName();
+		table_catalogs[i] = table_ref->ParentCatalog().GetName().GetIdentifierName();
+		table_schemas[i] = table_ref->schema.name.GetIdentifierName();
 		table_names[i] = table_name;
 		auto stored_snapshot = stored_snapshots.find(
 		    StringUtil::Lower(SqlUtils::FullName(table_catalogs[i], table_schemas[i], table_name)));
@@ -464,6 +464,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 
 		// Replace leaf[i] with its delta scan.
 		ColumnBinding mul_binding;
+		idx_t original_subtree_binding_count = 0;
 		auto &delta_leaf_node = GetNodeAtPath(term, leaves[i].path);
 		auto *delta_get = delta_leaf_node->type == LogicalOperatorType::LOGICAL_GET
 		                      ? dynamic_cast<LogicalGet *>(delta_leaf_node.get())
@@ -481,11 +482,16 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		} else {
 			// GET wrapped in projections/filters — rewrite the entire subtree.
 			auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
+			original_subtree_binding_count = subtree_ref->GetColumnBindings().size();
 			auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
 			mul_binding = rewritten.mul_binding;
 			subtree_ref = std::move(rewritten.op);
 		}
 		if (!flattened_leaves) {
+			if (original_subtree_binding_count > 0) {
+				RemapParentProjectionMapForInsertedOutput(term, leaves[i].path, original_subtree_binding_count,
+				                                         mul_binding);
+			}
 			UpdateParentProjectionMap(term, leaves[i], mul_binding);
 		}
 
@@ -500,7 +506,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned leaf %zu (table_index=%lu) to old snapshot %ld\n", j,
-				                    (unsigned long)old_get->table_index, (long)old_snapshots[j]);
+				(unsigned long)old_get->table_index.index, (long)old_snapshots[j]);
 			}
 		}
 
@@ -512,11 +518,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		vector<unique_ptr<Expression>> proj_exprs;
 
 		// Emit all columns except the multiplicity binding from the delta.
-		uint64_t mul_key =
-		    (uint64_t)mul_binding.table_index ^ ((uint64_t)mul_binding.column_index * 0x9e3779b97f4a7c15ULL);
+		uint64_t mul_key = DeltaJoinBindingKey(mul_binding);
 		for (idx_t c = 0; c < term_bindings.size(); c++) {
-			uint64_t key = (uint64_t)term_bindings[c].table_index ^
-			               ((uint64_t)term_bindings[c].column_index * 0x9e3779b97f4a7c15ULL);
+			uint64_t key = DeltaJoinBindingKey(term_bindings[c]);
 			if (key != mul_key) {
 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[c], term_bindings[c]));
 			}

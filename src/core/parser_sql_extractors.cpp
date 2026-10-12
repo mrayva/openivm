@@ -52,7 +52,7 @@ static bool ReadSource(TableRef &ref, string &table, string &alias) {
 	auto unaliased = base.Copy();
 	unaliased->alias.clear();
 	table = unaliased->ToString();
-	alias = base.alias.empty() ? base.table_name : base.alias;
+	alias = base.alias.empty() ? base.Table().GetIdentifierName() : base.alias.GetIdentifierName();
 	return true;
 }
 
@@ -61,10 +61,10 @@ static bool ReadOutputs(SelectNode &select, vector<string> &names, vector<string
 		if (expression->GetExpressionClass() == ExpressionClass::STAR) {
 			auto &star = expression->Cast<StarExpression>();
 			// The caller obtains the bound left-source columns for an unmodified star.
-			return select.select_list.size() == 1 && star.exclude_list.empty() && star.replace_list.empty() &&
-			       star.rename_list.empty() && !star.expr && !star.columns;
+			return select.select_list.size() == 1 && star.ExcludeList().empty() && star.ReplaceList().empty() &&
+			       star.RenameList().empty() && !star.Expression() && !star.IsColumns();
 		}
-		names.push_back(expression->GetName());
+		names.push_back(expression->GetName().GetIdentifierName());
 		expressions.push_back(expression->ToString());
 	}
 	return !names.empty();
@@ -92,7 +92,9 @@ static void CollectSelects(QueryNode &node, vector<SelectNode *> &result) {
 		}
 	}
 	for (auto &entry : node.cte_map.map) {
-		CollectSelects(*entry.second->query->node, result);
+		if (entry.second->query_node) {
+			CollectSelects(*entry.second->query_node, result);
+		}
 	}
 }
 
@@ -107,18 +109,18 @@ static optional_ptr<FunctionExpression> MatchFunction(ParsedExpression &expressi
 		return nullptr;
 	}
 	auto &function = expression.Cast<FunctionExpression>();
-	return StringUtil::CIEquals(function.function_name, name) ? &function : nullptr;
+	return StringUtil::CIEquals(function.FunctionName().GetIdentifierName(), name) ? &function : nullptr;
 }
 
-static string ColumnName(ParsedExpression &expression) {
+static string ColumnName(const ParsedExpression &expression) {
 	return expression.GetExpressionClass() == ExpressionClass::COLUMN_REF
-	           ? expression.Cast<ColumnRefExpression>().GetColumnName()
+	           ? expression.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName()
 	           : "";
 }
 
 static void Conjuncts(ParsedExpression &expression, vector<ParsedExpression *> &result) {
 	if (expression.GetExpressionType() == ExpressionType::CONJUNCTION_AND) {
-		for (auto &child : expression.Cast<ConjunctionExpression>().children) {
+		for (auto &child : expression.Cast<ConjunctionExpression>().GetChildren()) {
 			Conjuncts(*child, result);
 		}
 	} else {
@@ -126,15 +128,38 @@ static void Conjuncts(ParsedExpression &expression, vector<ParsedExpression *> &
 	}
 }
 
+static bool IsSimpleExistsProjection(const SelectNode &select) {
+	if (!select.groups.group_expressions.empty() || select.having || select.qualify || select.sample ||
+	    !select.modifiers.empty() || select.select_list.empty()) {
+		return false;
+	}
+	for (const auto &expression : select.select_list) {
+		auto expression_class = expression->GetExpressionClass();
+		if (expression_class != ExpressionClass::CONSTANT && expression_class != ExpressionClass::COLUMN_REF &&
+		    expression_class != ExpressionClass::STAR) {
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool ContainsSubquery(const ParsedExpression &expression) {
+	bool found = false;
+	ParsedExpressionIterator::VisitExpression<SubqueryExpression>(expression,
+	                                                               [&](const SubqueryExpression &) { found = true; });
+	return found;
+}
+
 static string RenameQualifier(ParsedExpression &expression, const string &table, const string &alias,
                               const string &replacement) {
 	auto copy = expression.Copy();
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*copy, [&](ColumnRefExpression &column) {
-		if (column.column_names.size() > 1 &&
-		    (StringUtil::CIEquals(column.column_names[column.column_names.size() - 2], alias) ||
-		     StringUtil::CIEquals(column.column_names[column.column_names.size() - 2],
+		auto &column_names = column.ColumnNamesMutable();
+		if (column_names.size() > 1 &&
+		    (StringUtil::CIEquals(column_names[column_names.size() - 2].GetIdentifierName(), alias) ||
+		     StringUtil::CIEquals(column_names[column_names.size() - 2].GetIdentifierName(),
 		                          SqlUtils::LastIdentifierPart(table)))) {
-			column.column_names = {replacement, column.GetColumnName()};
+			column_names = {Identifier(replacement), column.GetColumnName()};
 		}
 	});
 	return copy->ToString();
@@ -193,13 +218,13 @@ bool ExtractCountDistinctAggregate(const string &sql, const vector<string> &grou
 		if (!count) {
 			continue;
 		}
-		if (count_index != DConstants::INVALID_INDEX || !count->distinct || count->children.size() != 1 ||
-		    count->filter) {
+		if (count_index != DConstants::INVALID_INDEX || !count->Distinct() || count->GetArguments().size() != 1 ||
+		    count->Filter()) {
 			return false;
 		}
 		count_index = i;
-		out.distinct_expr = count->children[0]->ToString();
-		out.distinct_col = ColumnName(*count->children[0]);
+		out.distinct_expr = count->GetArguments()[0].GetExpression().ToString();
+		out.distinct_col = ColumnName(count->GetArguments()[0].GetExpression());
 		if (out.distinct_col.empty()) {
 			out.distinct_col = "openivm_distinct_value";
 		}
@@ -240,12 +265,12 @@ bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_n
 		}
 		for (idx_t i = 0; i < 2; i++) {
 			auto sum = MatchFunction(*select->select_list[i], "sum");
-			if (!sum || sum->children.size() != 1 || sum->distinct || sum->filter) {
+			if (!sum || sum->GetArguments().size() != 1 || sum->Distinct() || sum->Filter()) {
 				continue;
 			}
 			out.group_col = ColumnName(*select->select_list[1 - i]);
-			out.sum_col = ColumnName(*sum->children[0]);
-			out.sum_alias = select->select_list[i]->GetName();
+			out.sum_col = ColumnName(sum->GetArguments()[0].GetExpression());
+			out.sum_alias = select->select_list[i]->GetName().GetIdentifierName();
 			if (out.group_col.empty() || out.sum_col.empty() ||
 			    !StringUtil::CIEquals(ColumnName(*select->groups.group_expressions[0]), out.group_col)) {
 				return false;
@@ -255,18 +280,18 @@ bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_n
 					continue;
 				}
 				auto &comparison = outer->where_clause->Cast<ComparisonExpression>();
-				if (!StringUtil::CIEquals(ColumnName(*comparison.left), out.sum_alias) ||
-				    (comparison.type != ExpressionType::COMPARE_LESSTHAN &&
-				     comparison.type != ExpressionType::COMPARE_GREATERTHAN) ||
-				    comparison.right->GetExpressionClass() != ExpressionClass::CONSTANT) {
+				if (!StringUtil::CIEquals(ColumnName(comparison.Left()), out.sum_alias) ||
+				    (comparison.GetExpressionType() != ExpressionType::COMPARE_LESSTHAN &&
+				     comparison.GetExpressionType() != ExpressionType::COMPARE_GREATERTHAN) ||
+				    comparison.Right().GetExpressionClass() != ExpressionClass::CONSTANT) {
 					continue;
 				}
-				auto &value = comparison.right->Cast<ConstantExpression>().value;
+				auto value = comparison.Right().Cast<ConstantExpression>().GetLiteral().ToValue();
 				if (value.IsNull() || !value.type().IsNumeric() || value.GetValue<double>() != 0) {
 					return false;
 				}
-				out.comparison_op = ExpressionTypeToOperator(comparison.type);
-				out.threshold_sql = comparison.right->ToString();
+				out.comparison_op = ExpressionTypeToOperator(comparison.GetExpressionType());
+				out.threshold_sql = comparison.Right().ToString();
 				out.output_col = output_names[0];
 				return true;
 			}
@@ -295,7 +320,7 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 			} else {
 				vector<string> equalities;
 				for (const auto &column : join.using_columns) {
-					auto quoted = SqlUtils::QuoteIdentifier(column);
+					auto quoted = SqlUtils::QuoteIdentifier(column.GetIdentifierName());
 					equalities.push_back(SqlUtils::QuoteIdentifier(out.left_alias) + "." + quoted + " = " +
 					                     SqlUtils::QuoteIdentifier(out.right_alias) + "." + quoted);
 				}
@@ -315,8 +340,8 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	bool anti = false;
 	vector<string> filters;
 	for (auto expression : conjuncts) {
-		bool negated = expression->type == ExpressionType::OPERATOR_NOT;
-		auto candidate = negated ? expression->Cast<OperatorExpression>().children[0].get() : expression;
+		bool negated = expression->GetExpressionType() == ExpressionType::OPERATOR_NOT;
+		auto candidate = negated ? expression->Cast<OperatorExpression>().GetChildren()[0].get() : expression;
 		if (candidate->GetExpressionClass() != ExpressionClass::SUBQUERY) {
 			filters.push_back("(" + expression->ToString() + ")");
 			continue;
@@ -327,26 +352,28 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 		subquery = &candidate->Cast<SubqueryExpression>();
 		anti = negated;
 	}
-	if (!subquery || (subquery->subquery_type != SubqueryType::EXISTS &&
-	                  (subquery->subquery_type != SubqueryType::ANY ||
-	                   subquery->comparison_type != ExpressionType::COMPARE_EQUAL))) {
+	if (!subquery || (subquery->GetSubqueryType() != SubqueryType::EXISTS &&
+	                  (subquery->GetSubqueryType() != SubqueryType::ANY ||
+	                   subquery->GetComparisonType() != ExpressionType::COMPARE_EQUAL))) {
 		return false;
 	}
-	auto right = AsSelect(*subquery->subquery->node);
+	auto right = AsSelect(*subquery->Subquery()->node);
 	if (!right || !ReadSource(*right->from_table, out.right_table, out.right_alias)) {
 		return false;
 	}
 	out.join_type = anti ? "anti" : "semi";
 	out.post_filter = StringUtil::Join(filters, " AND ");
 	bool simple_left = ReadSource(*select->from_table, out.left_table, out.left_alias);
-	if (subquery->subquery_type == SubqueryType::EXISTS) {
-		if (!simple_left) {
+	if (subquery->GetSubqueryType() == SubqueryType::EXISTS) {
+		if (!simple_left || !IsSimpleExistsProjection(*right) ||
+		    (right->where_clause && ContainsSubquery(*right->where_clause))) {
 			return false;
 		}
+		out.is_exists_subquery = true;
 		out.predicate = right->where_clause ? right->where_clause->ToString() : "true";
 		return true;
 	}
-	if (!subquery->child || right->select_list.size() != 1) {
+	if (!subquery->GetChild() || right->select_list.size() != 1) {
 		return false;
 	}
 	if (!simple_left) {
@@ -359,9 +386,9 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	auto original_right_alias = out.right_alias;
 	out.right_alias = "openivm_right";
 	out.left_key_col = "openivm_saj_key";
-	out.left_key_expr = simple_left ? RenameQualifier(*subquery->child, out.left_table, out.left_alias, out.left_alias)
+	out.left_key_expr = simple_left ? RenameQualifier(*subquery->GetChild(), out.left_table, out.left_alias, out.left_alias)
 	                                : SqlUtils::QuoteIdentifier(out.left_alias) + "." +
-	                                      SqlUtils::QuoteIdentifier(subquery->child->GetName());
+	                                      SqlUtils::QuoteIdentifier(subquery->GetChild()->GetName().GetIdentifierName());
 	out.right_key_expr =
 	    RenameQualifier(*right->select_list[0], out.right_table, original_right_alias, out.right_alias);
 	out.predicate = out.left_key_expr + " = " + out.right_key_expr;

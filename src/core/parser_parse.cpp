@@ -17,8 +17,8 @@ namespace duckdb {
 
 static unique_ptr<SQLStatement> BuildInternalPragma(const string &name, const string &query) {
 	auto statement = make_uniq<PragmaStatement>();
-	statement->info->name = name;
-	statement->info->parameters.push_back(make_uniq<ConstantExpression>(Value(query)));
+	statement->info->name = Identifier(name);
+	statement->info->parameters.push_back(ConstantExpression::FromValue(Value(query)));
 	return std::move(statement);
 }
 
@@ -82,8 +82,25 @@ ParserOverrideResult MaterializedViewParserExtension::OverrideFunction(ParserExt
 }
 
 ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(ParserExtensionInfo *info,
-                                                                          const string &query) {
-	return ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
+                                                                          const vector<SimpleToken> &tokens) {
+	string query;
+	idx_t consumed = 0;
+	for (auto &token : tokens) {
+		if (token.type == TokenType::END_OF_INPUT || token.type == TokenType::END_OF_INPUT_AUTOCOMPLETE) {
+			break;
+		}
+		query += token.text;
+		query.push_back(' ');
+		consumed++;
+		if (token.type == TokenType::TERMINATOR) {
+			break;
+		}
+	}
+	auto result = ParseMaterializedViewStatement(query, InputDialectFromInfo(info));
+	if (result.type == ParserExtensionResultType::PARSE_SUCCESSFUL) {
+		result.consumed_tokens = NumericCast<int64_t>(consumed);
+	}
+	return result;
 }
 
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {

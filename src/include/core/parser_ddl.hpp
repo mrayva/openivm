@@ -54,9 +54,9 @@ string BuildCreateDeltaFromDataOperation(const string &delta_table, const string
 string BuildDropViewStatement(const DropInfo &drop_info);
 string BuildDropTableStatement(const DropInfo &drop_info);
 unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names);
+                                      vector<LogicalType> &return_types, vector<Identifier> &names);
 unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names);
+                                       vector<LogicalType> &return_types, vector<Identifier> &names);
 unique_ptr<GlobalTableFunctionState> InitDropView(ClientContext &context, TableFunctionInitInput &input);
 void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChunk &output);
 

@@ -25,15 +25,28 @@
 namespace duckdb {
 AggregateFunction BindAggregateByName(ClientContext &context, const string &name,
                                       const vector<LogicalType> &arg_types) {
-	auto &catalog = Catalog::GetSystemCatalog(context);
-	auto &entry = catalog.GetEntry<AggregateFunctionCatalogEntry>(context, DEFAULT_SCHEMA, name);
+	auto &system_catalog = Catalog::GetSystemCatalog(context);
+	auto &entry = system_catalog.GetEntry<AggregateFunctionCatalogEntry>(
+	    context, QualifiedName(system_catalog.GetName(), Identifier(DEFAULT_SCHEMA), Identifier(name)));
 	FunctionBinder binder(context);
 	ErrorData error;
 	auto best = binder.BindFunction(entry.name, entry.functions, arg_types, error);
 	if (!best.IsValid()) {
 		throw InternalException("PlanRewrite: failed to bind aggregate '%s'", name);
 	}
-	return entry.functions.GetFunctionByOffset(best.GetIndex());
+	return *entry.functions.GetFunctionByOffset(best.GetIndex());
+}
+
+static unique_ptr<BoundAggregateExpression>
+BindAggregateExpressionByName(ClientContext &context, const string &name,
+                              vector<unique_ptr<Expression>> children) {
+	vector<LogicalType> argument_types;
+	argument_types.reserve(children.size());
+	for (auto &child : children) {
+		argument_types.push_back(child->GetReturnType());
+	}
+	auto function = BindAggregateByName(context, name, argument_types);
+	return function.Bind(context, std::move(children));
 }
 
 static bool IsStddevOrVariance(const string &name) {
@@ -70,8 +83,8 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 	auto &agg = plan->Cast<LogicalAggregate>();
 	bool any_filter = false;
 	for (auto &expr : agg.expressions) {
-		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
-		    expr->Cast<BoundAggregateExpression>().filter) {
+		if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE &&
+		    expr->Cast<BoundAggregateExpression>().GetFilter()) {
 			any_filter = true;
 			break;
 		}
@@ -81,36 +94,34 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
 	}
 	bool rewritten = false;
 	for (auto &expr : agg.expressions) {
-		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 			continue;
 		}
 		auto &bound = expr->Cast<BoundAggregateExpression>();
-		if (!bound.filter) {
+		if (!bound.GetFilter()) {
 			continue;
 		}
-		if (bound.function.name == "list") {
+		if (bound.Function().GetName() == "list") {
 			continue;
 		}
-		auto filter_expr = std::move(bound.filter); // nulls bound.filter
-		if (bound.children.empty()) {
-			string saved_alias = std::move(bound.alias);
+		auto filter_expr = std::move(bound.GetFilterMutable());
+		if (bound.GetChildren().empty()) {
+			Identifier saved_alias = bound.GetAlias();
 			auto then_expr = make_uniq<BoundConstantExpression>(Value::BIGINT(1));
 			auto else_expr = make_uniq<BoundConstantExpression>(Value(LogicalType::BIGINT));
 			auto case_expr =
 			    make_uniq<BoundCaseExpression>(std::move(filter_expr), std::move(then_expr), std::move(else_expr));
-			auto count_func = BindAggregateByName(context, "count", {LogicalType::BIGINT});
 			vector<unique_ptr<Expression>> count_args;
 			count_args.push_back(std::move(case_expr));
-			auto new_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
-			                                                    nullptr, AggregateType::NON_DISTINCT);
-			new_expr->alias = std::move(saved_alias);
+			auto new_expr = BindAggregateExpressionByName(context, "count", std::move(count_args));
+			new_expr->SetAlias(std::move(saved_alias));
 			expr = std::move(new_expr);
 			rewritten = true;
 		} else {
-			auto arg_type = bound.children[0]->return_type;
+			auto arg_type = bound.GetChildren()[0]->GetReturnType();
 			auto else_expr = make_uniq<BoundConstantExpression>(Value(arg_type)); // NULL of same type
-			bound.children[0] = make_uniq<BoundCaseExpression>(std::move(filter_expr), std::move(bound.children[0]),
-			                                                   std::move(else_expr));
+			bound.GetChildrenMutable()[0] = make_uniq<BoundCaseExpression>(
+			    std::move(filter_expr), std::move(bound.GetChildrenMutable()[0]), std::move(else_expr));
 			rewritten = true;
 		}
 	}
@@ -194,56 +205,58 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 	for (idx_t projection_index = 0; projection_index < output_projection.expressions.size(); projection_index++) {
 		Expression *resolved = output_projection.expressions[projection_index].get();
 		while (resolved) {
-			while (resolved->expression_class == ExpressionClass::BOUND_CAST) {
-				resolved = resolved->Cast<BoundCastExpression>().child.get();
+			while (BoundCastExpression::IsCast(*resolved)) {
+				auto &cast = resolved->Cast<BoundFunctionExpression>();
+				resolved = const_cast<Expression *>(&BoundCastExpression::Child(cast));
 			}
-			if (resolved->type != ExpressionType::BOUND_COLUMN_REF) {
+			if (resolved->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				break;
 			}
 			auto &ref = resolved->Cast<BoundColumnRefExpression>();
-			if (ref.binding.table_index == agg.aggregate_index) {
+			if (ref.Binding().table_index == agg.aggregate_index) {
 				break;
 			}
 			LogicalProjection *referenced_projection = nullptr;
 			for (idx_t projection_depth = 1; projection_depth < projections.size(); projection_depth++) {
-				if (projections[projection_depth]->table_index == ref.binding.table_index) {
+				if (projections[projection_depth]->table_index == ref.Binding().table_index) {
 					referenced_projection = projections[projection_depth];
 					break;
 				}
 			}
-			if (!referenced_projection || ref.binding.column_index >= referenced_projection->expressions.size()) {
+			if (!referenced_projection ||
+			    ref.Binding().column_index.GetIndexUnsafe() >= referenced_projection->expressions.size()) {
 				resolved = nullptr;
 				break;
 			}
-			resolved = referenced_projection->expressions[ref.binding.column_index].get();
+			resolved = referenced_projection->expressions[ref.Binding().column_index.GetIndexUnsafe()].get();
 		}
-		if (!resolved || resolved->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (!resolved || resolved->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			continue;
 		}
 		auto &ref = resolved->Cast<BoundColumnRefExpression>();
-		if (ref.binding.table_index != agg.aggregate_index || ref.binding.column_index >= original_aggregate_count) {
+		if (ref.Binding().table_index != agg.aggregate_index ||
+		    ref.Binding().column_index.GetIndexUnsafe() >= original_aggregate_count) {
 			continue;
 		}
-		auto &aggregate_expr = agg.expressions[ref.binding.column_index];
-		if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		auto &aggregate_expr = agg.expressions[ref.Binding().column_index.GetIndexUnsafe()];
+		if (aggregate_expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 			continue;
 		}
 		auto &sum = aggregate_expr->Cast<BoundAggregateExpression>();
-		if (sum.function.name != "sum" || sum.IsDistinct() || sum.children.size() != 1) {
+		if (sum.Function().GetName() != "sum" || sum.IsDistinct() || sum.GetChildren().size() != 1) {
 			continue;
 		}
-		if (sum.alias.find(string(openivm::SUM_COL_PREFIX)) == 0 ||
-		    sum.alias.find(string(openivm::VAR_SQ_COL_PREFIX)) == 0 ||
-		    sum.alias.find(string(openivm::VAR_SQP_COL_PREFIX)) == 0) {
+		auto sum_alias = sum.GetAlias().GetIdentifierName();
+		if (sum_alias.find(string(openivm::SUM_COL_PREFIX)) == 0 ||
+		    sum_alias.find(string(openivm::VAR_SQ_COL_PREFIX)) == 0 ||
+		    sum_alias.find(string(openivm::VAR_SQP_COL_PREFIX)) == 0) {
 			continue;
 		}
 
-		auto count_func = BindAggregateByName(context, "count", {sum.children[0]->return_type});
 		vector<unique_ptr<Expression>> count_args;
-		count_args.push_back(sum.children[0]->Copy());
-		auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
-		                                                      nullptr, AggregateType::NON_DISTINCT);
-		count_expr->alias = string(openivm::SUM_COUNT_COL_PREFIX) + to_string(projection_index);
+		count_args.push_back(sum.GetChildren()[0]->Copy());
+		auto count_expr = BindAggregateExpressionByName(context, "count", std::move(count_args));
+		count_expr->SetAlias(Identifier(string(openivm::SUM_COUNT_COL_PREFIX) + to_string(projection_index)));
 		outputs.push_back({projection_index, agg.expressions.size()});
 		agg.expressions.push_back(std::move(count_expr));
 	}
@@ -274,8 +287,8 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 	auto &agg = agg_search->Cast<LogicalAggregate>();
 	bool has_derived = false;
 	for (auto &expr : agg.expressions) {
-		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
-			auto &name = expr->Cast<BoundAggregateExpression>().function.name;
+		if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
+			auto &name = expr->Cast<BoundAggregateExpression>().Function().GetName().GetIdentifierName();
 			if (name == "avg" || IsStddevOrVariance(name)) {
 				has_derived = true;
 				break;
@@ -305,27 +318,30 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 
 	for (idx_t i = 0; i < agg.expressions.size(); i++) {
 		auto &expr = agg.expressions[i];
-		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
 		}
 		auto &bound = expr->Cast<BoundAggregateExpression>();
-		if (bound.children.empty()) {
+		if (bound.GetChildren().empty()) {
 			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
 		}
 
-		bool is_avg = (bound.function.name == "avg");
-		bool is_stddev = IsStddevOrVariance(bound.function.name);
+		auto func_name = bound.Function().GetName().GetIdentifierName();
+		bool is_avg = func_name == "avg";
+		bool is_stddev = IsStddevOrVariance(func_name);
 		if (!is_avg && !is_stddev) {
 			nondecomposed_remap[i] = new_exprs.size();
 			new_exprs.push_back(std::move(expr));
 			continue;
 		}
 
-		string alias = bound.alias.empty() ? (bound.function.name + "_" + bound.children[0]->GetName()) : bound.alias;
+		string alias = bound.GetAlias().empty()
+		                   ? (func_name + "_" + bound.GetChildren()[0]->GetName().GetIdentifierName())
+		                   : bound.GetAlias().GetIdentifierName();
 		{
 			string clean;
 			bool last_under = false;
@@ -345,38 +361,32 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 				alias = std::move(clean);
 			}
 		}
-		auto arg_type = bound.children[0]->return_type;
+		auto arg_type = bound.GetChildren()[0]->GetReturnType();
 
 		Decomp d;
 		d.kind = is_avg ? DecompKind::AVG : DecompKind::STDDEV;
 		d.alias = alias;
-		d.func_name = bound.function.name;
+		d.func_name = func_name;
 		d.old_idx = i;
-		auto sum_func = BindAggregateByName(context, "sum", {arg_type});
 		vector<unique_ptr<Expression>> sum_args;
-		sum_args.push_back(bound.children[0]->Copy());
-		auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
-		                                                    AggregateType::NON_DISTINCT);
-		sum_expr->alias = string(openivm::SUM_COL_PREFIX) + alias;
+		sum_args.push_back(bound.GetChildren()[0]->Copy());
+		auto sum_expr = BindAggregateExpressionByName(context, "sum", std::move(sum_args));
+		sum_expr->SetAlias(Identifier(string(openivm::SUM_COL_PREFIX) + alias));
 		d.sum_idx = new_exprs.size();
 		new_exprs.push_back(std::move(sum_expr));
 		if (is_stddev) {
-			auto sq_arg = opt.BindScalarFunction("*", bound.children[0]->Copy(), bound.children[0]->Copy());
-			auto sum_sq_func = BindAggregateByName(context, "sum", {sq_arg->return_type});
+			auto sq_arg = opt.BindScalarFunction("*", bound.GetChildren()[0]->Copy(), bound.GetChildren()[0]->Copy());
 			vector<unique_ptr<Expression>> sum_sq_args;
 			sum_sq_args.push_back(std::move(sq_arg));
-			auto sum_sq_expr = make_uniq<BoundAggregateExpression>(std::move(sum_sq_func), std::move(sum_sq_args),
-			                                                       nullptr, nullptr, AggregateType::NON_DISTINCT);
-			sum_sq_expr->alias = string(SumSqPrefix(bound.function.name)) + alias;
+			auto sum_sq_expr = BindAggregateExpressionByName(context, "sum", std::move(sum_sq_args));
+			sum_sq_expr->SetAlias(Identifier(string(SumSqPrefix(func_name)) + alias));
 			d.sum_sq_idx = new_exprs.size();
 			new_exprs.push_back(std::move(sum_sq_expr));
 		}
-		auto count_func = BindAggregateByName(context, "count", {arg_type});
 		vector<unique_ptr<Expression>> count_args;
-		count_args.push_back(bound.children[0]->Copy());
-		auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
-		                                                      nullptr, AggregateType::NON_DISTINCT);
-		count_expr->alias = string(openivm::COUNT_COL_PREFIX) + alias;
+		count_args.push_back(bound.GetChildren()[0]->Copy());
+		auto count_expr = BindAggregateExpressionByName(context, "count", std::move(count_args));
+		count_expr->SetAlias(Identifier(string(openivm::COUNT_COL_PREFIX) + alias));
 		d.count_idx = new_exprs.size();
 		new_exprs.push_back(std::move(count_expr));
 
@@ -417,47 +427,49 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 		    IsStddevVariant(d.func_name) ? opt.BindScalarFunction("sqrt", std::move(var_expr)) : std::move(var_expr);
 		int64_t threshold = IsPopulationVariant(d.func_name) ? 0 : 1;
 		auto count_check = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-		auto when_expr =
-		    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
-		                                         make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
-		auto else_expr = make_uniq<BoundConstantExpression>(Value(formula->return_type));
+		auto when_expr = BoundComparisonExpression::Create(
+		    ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
+		    make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
+		auto else_expr = make_uniq<BoundConstantExpression>(Value(formula->GetReturnType()));
 		return make_uniq<BoundCaseExpression>(std::move(when_expr), std::move(formula), std::move(else_expr));
 	};
 	for (auto &d : decomps) {
-		ColumnBinding old_binding(agg.aggregate_index, d.old_idx);
+		ColumnBinding old_binding(agg.aggregate_index, ProjectionIndex(d.old_idx));
 		d.user_alias = d.alias; // fallback if no direct ref
 		for (idx_t pi = 0; pi < original_proj_size; pi++) {
-			if (proj.expressions[pi]->type != ExpressionType::BOUND_COLUMN_REF) {
+			if (proj.expressions[pi]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				continue;
 			}
 			auto &ref = proj.expressions[pi]->Cast<BoundColumnRefExpression>();
-			if (ref.binding == old_binding) {
-				d.user_alias = ref.alias.empty() ? d.alias : ref.alias;
+			if (ref.Binding() == old_binding) {
+				d.user_alias = ref.GetAlias().empty() ? d.alias : ref.GetAlias().GetIdentifierName();
 				break;
 			}
 		}
 	}
 	std::map<uint64_t, const Decomp *> old_binding_to_decomp;
 	for (auto &d : decomps) {
-		uint64_t key = (uint64_t)agg.aggregate_index ^ ((uint64_t)d.old_idx * 0x9e3779b97f4a7c15ULL);
+		uint64_t key = (uint64_t)agg.aggregate_index.index ^ ((uint64_t)d.old_idx * 0x9e3779b97f4a7c15ULL);
 		old_binding_to_decomp[key] = &d;
 	}
 	std::function<void(unique_ptr<Expression> &)> walk = [&](unique_ptr<Expression> &expr) {
-		if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = expr->Cast<BoundColumnRefExpression>();
-			if (bcr.binding.table_index == agg.aggregate_index) {
+			if (bcr.Binding().table_index == agg.aggregate_index) {
 				uint64_t key =
-				    (uint64_t)bcr.binding.table_index ^ ((uint64_t)bcr.binding.column_index * 0x9e3779b97f4a7c15ULL);
+				    (uint64_t)bcr.Binding().table_index.index ^
+				    ((uint64_t)bcr.Binding().column_index.GetIndexUnsafe() * 0x9e3779b97f4a7c15ULL);
 				auto dit = old_binding_to_decomp.find(key);
 				if (dit != old_binding_to_decomp.end()) {
 					auto replacement = build_replacement(*dit->second);
-					replacement->alias = bcr.alias;
+					replacement->SetAlias(bcr.GetAlias());
 					expr = std::move(replacement);
 					return; // do NOT descend into the replacement
 				}
-				auto rit = nondecomposed_remap.find(bcr.binding.column_index);
-				if (rit != nondecomposed_remap.end() && rit->second != bcr.binding.column_index) {
-					bcr.binding.column_index = rit->second;
+				auto old_column_index = bcr.Binding().column_index.GetIndexUnsafe();
+				auto rit = nondecomposed_remap.find(old_column_index);
+				if (rit != nondecomposed_remap.end() && rit->second != old_column_index) {
+					bcr.BindingMutable().column_index = ProjectionIndex(rit->second);
 				}
 			}
 		}
@@ -498,19 +510,19 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 			}
 		}
 		auto sum_pt = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
-		sum_pt->alias = string(openivm::SUM_COL_PREFIX) + col_suffix;
+		sum_pt->SetAlias(Identifier(string(openivm::SUM_COL_PREFIX) + col_suffix));
 		proj.expressions.push_back(std::move(sum_pt));
 
 		if (d.kind == DecompKind::STDDEV) {
 			ColumnBinding sum_sq_binding = agg_bindings[group_count + d.sum_sq_idx];
 			LogicalType sum_sq_type = agg_types[group_count + d.sum_sq_idx];
 			auto sum_sq_pt = make_uniq<BoundColumnRefExpression>(sum_sq_type, sum_sq_binding);
-			sum_sq_pt->alias = string(SumSqPrefix(d.func_name)) + col_suffix;
+			sum_sq_pt->SetAlias(Identifier(string(SumSqPrefix(d.func_name)) + col_suffix));
 			proj.expressions.push_back(std::move(sum_sq_pt));
 		}
 
 		auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-		count_pt->alias = string(openivm::COUNT_COL_PREFIX) + col_suffix;
+		count_pt->SetAlias(Identifier(string(openivm::COUNT_COL_PREFIX) + col_suffix));
 		proj.expressions.push_back(std::move(count_pt));
 	}
 	proj.ResolveOperatorTypes();

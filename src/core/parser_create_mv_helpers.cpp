@@ -31,10 +31,17 @@ string SqlCsvLiteralOrNull(const vector<string> &values) {
 
 static void AddColumnIfNotExists(vector<string> &ddl, const string &table_name, optional_ptr<TableCatalogEntry> table,
                                  const string &column_definition) {
-	if (table && table->ColumnExists(column_definition.substr(0, column_definition.find(' ')))) {
+	if (table && table->ColumnExists(Identifier(column_definition.substr(0, column_definition.find(' '))))) {
 		return;
 	}
 	ddl.push_back("alter table " + table_name + " add column if not exists " + column_definition);
+}
+
+static optional_ptr<TableCatalogEntry> GetTableEntry(ClientContext &context, const string &catalog,
+                                                     const string &schema, const string &table) {
+	return Catalog::GetEntry<TableCatalogEntry>(
+	    context, QualifiedName(Identifier(catalog), Identifier(schema), Identifier(table)),
+	    OnEntryNotFound::RETURN_NULL);
 }
 
 // Read the caller's snapshot, including metadata inserted earlier in this
@@ -77,12 +84,9 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
                                     vector<string> &ddl) {
 	// Inspect this transaction's catalog, not a process-wide initialization flag: older
 	// databases and other attached catalogs must still receive missing columns.
-	auto views = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::VIEWS_TABLE,
-	                                                  OnEntryNotFound::RETURN_NULL);
-	auto deltas = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::DELTA_TABLES_TABLE,
-	                                                   OnEntryNotFound::RETURN_NULL);
-	auto history = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::HISTORY_TABLE,
-	                                                    OnEntryNotFound::RETURN_NULL);
+	auto views = GetTableEntry(context, catalog, schema, openivm::VIEWS_TABLE);
+	auto deltas = GetTableEntry(context, catalog, schema, openivm::DELTA_TABLES_TABLE);
+	auto history = GetTableEntry(context, catalog, schema, openivm::HISTORY_TABLE);
 	OPENIVM_DEBUG_PRINT("[CREATE] Checking metadata schema in %s.%s\n", catalog.c_str(), schema.c_str());
 
 	ddl.push_back(CreateMVDependenciesSQL());
@@ -278,8 +282,7 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		// a DuckDB file lock after writing metadata but before creating the physical
 		// DuckLake/default-catalog objects, a retry should clean that stale row rather
 		// than report a misleading duplicate MV.
-		auto views = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::VIEWS_TABLE,
-		                                                  OnEntryNotFound::RETURN_NULL);
+		auto views = GetTableEntry(context, catalog, schema, openivm::VIEWS_TABLE);
 		if (views && HasViewMetadata(context, *views, view_name)) {
 			ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
 		}

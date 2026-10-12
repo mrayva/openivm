@@ -5,6 +5,7 @@
 #include "core/refresh_locks.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/execution/operator/persistent/physical_delete.hpp"
 #include "duckdb/execution/operator/persistent/physical_insert.hpp"
@@ -40,7 +41,7 @@ public:
 		vector<LogicalType> generated_types;
 		generated_types.reserve(generated_expressions.size());
 		for (auto &expression : generated_expressions) {
-			generated_types.push_back(expression->return_type);
+			generated_types.push_back(expression->GetReturnType());
 		}
 		generated_values.Initialize(Allocator::Get(context), generated_types);
 		delta_rows.Initialize(Allocator::Get(context), delta_types);
@@ -60,7 +61,7 @@ class TransactionalDeltaAppender {
 public:
 	TransactionalDeltaAppender(TableCatalogEntry &base_table_p, TableCatalogEntry &delta_table_p,
 	                           vector<unique_ptr<Expression>> generated_expressions_p)
-	    : delta_table(delta_table_p), delta_types(delta_table.GetTypes()),
+	    : delta_table(delta_table_p.Cast<DuckTableEntry>()), delta_types(delta_table.GetTypes()),
 	      generated_expressions(std::move(generated_expressions_p)) {
 		BuildDeltaColumnMap(base_table_p);
 	}
@@ -86,9 +87,10 @@ public:
 		}
 		for (idx_t delta_index = 0; delta_index < delta_column_map.size(); delta_index++) {
 			if (delta_index == multiplicity_index.GetIndex()) {
-				delta_rows.data[delta_index].Reference(Value::INTEGER(multiplicity));
+				delta_rows.data[delta_index].Reference(Value::INTEGER(multiplicity), count_t(base_rows.size()));
 			} else if (delta_index == timestamp_index.GetIndex()) {
-				delta_rows.data[delta_index].Reference(Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()));
+				delta_rows.data[delta_index].Reference(Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()),
+				                                      count_t(base_rows.size()));
 			} else {
 				auto generated_index = generated_column_map[delta_index];
 				if (generated_index != DConstants::INVALID_INDEX) {
@@ -113,8 +115,9 @@ public:
 		}
 		auto &optimistic_collection = storage.GetOptimisticCollection(context, state.collection_index);
 		auto &collection = *optimistic_collection.collection;
-		if (collection.Append(delta_rows, state.local_append_state)) {
-			state.optimistic_writer->WriteNewRowGroup(optimistic_collection);
+		auto flushed_row_group = collection.Append(delta_rows, state.local_append_state);
+		if (flushed_row_group.IsValid()) {
+			state.optimistic_writer->WriteNewRowGroup(optimistic_collection, flushed_row_group.GetIndex());
 		}
 	}
 
@@ -126,7 +129,7 @@ public:
 		auto &storage = delta_table.GetStorage();
 		auto &optimistic_collection = storage.GetOptimisticCollection(context, state.collection_index);
 		auto &collection = *optimistic_collection.collection;
-		TransactionData transaction_data(0, 0);
+		auto transaction_data = TransactionData::Unversioned();
 		collection.FinalizeAppend(transaction_data, state.local_append_state);
 
 		lock_guard<mutex> guard(append_lock);
@@ -136,14 +139,14 @@ public:
 			storage.InitializeLocalAppend(append_state, delta_table, context, no_constraints);
 			auto &transaction = DuckTransaction::Get(context, delta_table.catalog);
 			for (auto &chunk : collection.Chunks(transaction)) {
-				storage.LocalAppend(append_state, context, chunk, false);
+				storage.LocalAppend(append_state, delta_table, context, chunk, false);
 			}
 			storage.FinalizeLocalAppend(append_state);
 			return;
 		}
 		state.optimistic_writer->WriteUnflushedRowGroups(optimistic_collection);
 		state.optimistic_writer->FinalFlush();
-		storage.LocalMerge(context, optimistic_collection);
+		storage.LocalMerge(context, delta_table, optimistic_collection);
 		storage.GetOptimisticWriter(context).Merge(*state.optimistic_writer);
 	}
 
@@ -160,7 +163,7 @@ private:
 		case_insensitive_map_t<idx_t> base_column_index;
 		idx_t base_index = 0;
 		for (auto &column : base_table.GetColumns().Physical()) {
-			base_column_index[column.Name()] = base_index++;
+			base_column_index[column.Name().GetIdentifierName()] = base_index++;
 		}
 
 		idx_t generated_index = 0;
@@ -176,10 +179,11 @@ private:
 				timestamp_index = column.Physical().index;
 				continue;
 			}
-			auto entry = base_column_index.find(column.Name());
+			auto entry = base_column_index.find(column.Name().GetIdentifierName());
 			if (entry == base_column_index.end()) {
 				if (generated_index >= generated_expressions.size()) {
-					throw InternalException("OpenIVM could not bind generated delta column '%s'", column.Name());
+					throw InternalException("OpenIVM could not bind generated delta column '%s',",
+					                        column.Name().GetIdentifierName());
 				}
 				delta_column_map.push_back(DConstants::INVALID_INDEX);
 				generated_column_map.back() = generated_index++;
@@ -195,7 +199,7 @@ private:
 		}
 	}
 
-	TableCatalogEntry &delta_table;
+	DuckTableEntry &delta_table;
 	vector<LogicalType> delta_types;
 	vector<unique_ptr<Expression>> generated_expressions;
 	vector<idx_t> delta_column_map;
@@ -253,7 +257,7 @@ static idx_t SelectUnseenRows(DataChunk &input, idx_t row_id_index, array<RowIdD
                               DataChunk &selected_input) {
 	auto &row_ids = input.data[row_id_index];
 	row_ids.Flatten(input.size());
-	auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+		auto row_id_data = FlatVector::GetData<row_t>(row_ids);
 	for (auto &candidate_rows : candidates) {
 		candidate_rows.clear();
 	}
@@ -299,7 +303,7 @@ public:
 		vector<LogicalType> update_types;
 		update_types.reserve(update_expressions.size());
 		for (auto &expression : update_expressions) {
-			update_types.push_back(expression->return_type);
+			update_types.push_back(expression->GetReturnType());
 		}
 		update_values.Initialize(Allocator::Get(context.client), update_types);
 		if (!capture_existing_rows) {
@@ -488,7 +492,7 @@ public:
 		}
 
 		if (!reserved_row_ids.empty()) {
-			auto fetch_data = FlatVector::GetData<row_t>(fetch_row_ids);
+		auto fetch_data = FlatVector::GetDataMutable<row_t>(fetch_row_ids);
 			for (idx_t index = 0; index < reserved_row_ids.size(); index++) {
 				fetch_data[index] = reserved_row_ids[index];
 			}
@@ -542,7 +546,7 @@ public:
 		DataChunk rows;
 		rows.Initialize(Allocator::Get(context), row_fetcher.Types());
 		ColumnFetchState fetch_state;
-		auto row_id_data = FlatVector::GetData<row_t>(row_ids);
+		auto row_id_data = FlatVector::GetDataMutable<row_t>(row_ids);
 		idx_t count = 0;
 		idx_t invisible_count = 0;
 		for (auto row_id : state.captured_row_ids) {
@@ -621,7 +625,7 @@ public:
 		vector<LogicalType> update_types;
 		update_types.reserve(update.expressions.size());
 		for (auto &expression : update.expressions) {
-			update_types.push_back(expression->return_type);
+			update_types.push_back(expression->GetReturnType());
 		}
 		update_values.Initialize(Allocator::Get(context.client), update_types);
 		pending_new_rows.Initialize(Allocator::Get(context.client), base_types);
@@ -772,8 +776,8 @@ private:
 		for (auto update_index : default_update_indexes) {
 			auto &expression = update.expressions[update_index];
 			const auto reference_index = delegated_types.size();
-			delegated_types.push_back(expression->return_type);
-			expression = make_uniq<BoundReferenceExpression>(expression->return_type, reference_index);
+			delegated_types.push_back(expression->GetReturnType());
+			expression = make_uniq<BoundReferenceExpression>(expression->GetReturnType(), reference_index);
 		}
 		delegated_types.push_back(input_types.back());
 	}
@@ -822,7 +826,7 @@ private:
 			auto &expression = *update.expressions[index];
 			D_ASSERT(expression.GetExpressionType() == ExpressionType::BOUND_REF);
 			auto &reference = expression.Cast<BoundReferenceExpression>();
-			lstate.update_values.data[index].Reference(lstate.selected_input.data[reference.index]);
+			lstate.update_values.data[index].Reference(lstate.selected_input.data[reference.Index()]);
 		}
 		for (idx_t column = 0; column < coordinator->RowFetcher().Types().size(); column++) {
 			lstate.pending_new_rows.data[column].Reference(lstate.preimage_rows.data[column]);
@@ -844,7 +848,7 @@ static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &co
                                                                TableCatalogEntry &delta_table) {
 	case_insensitive_set_t physical_columns;
 	for (auto &column : base_table.GetColumns().Physical()) {
-		physical_columns.insert(column.Name());
+		physical_columns.insert(column.Name().GetIdentifierName());
 	}
 	vector<unique_ptr<Expression>> generated_expressions;
 	auto binder = Binder::CreateBinder(context);
@@ -852,7 +856,7 @@ static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &co
 	CheckBinder generated_binder(*binder, context, base_table.name, base_table.GetColumns(), bound_columns);
 	for (auto &column : delta_table.GetColumns().Physical()) {
 		if (column.Name() == openivm::MULTIPLICITY_COL || column.Name() == openivm::TIMESTAMP_COL ||
-		    physical_columns.find(column.Name()) != physical_columns.end()) {
+		    physical_columns.find(column.Name().GetIdentifierName()) != physical_columns.end()) {
 			continue;
 		}
 		auto &base_column = base_table.GetColumns().GetColumn(column.Name());

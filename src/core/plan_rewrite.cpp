@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/execution/expression_executor.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
+#include "duckdb/function/window/rows_functions.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/deliminator.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
@@ -84,22 +85,21 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 	// COUNT(*) aggregate
 	auto count_star = CountStarFun::GetFunction();
 	vector<unique_ptr<Expression>> count_args;
-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star), std::move(count_args), nullptr,
-	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = openivm::DISTINCT_COUNT_COL;
+	auto count_expr = count_star.Bind(context, std::move(count_args));
+	count_expr->SetAlias(Identifier(openivm::DISTINCT_COUNT_COL));
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(count_expr));
 
-	idx_t group_index = binder.GenerateTableIndex();
-	idx_t aggregate_index = binder.GenerateTableIndex();
+	TableIndex group_index = binder.GenerateTableIndex();
+	TableIndex aggregate_index = binder.GenerateTableIndex();
 
 	auto agg_node = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
 
 	GroupingSet grouping_set;
 	for (idx_t i = 0; i < child_bindings.size(); i++) {
 		auto group_expr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
-		grouping_set.insert(agg_node->groups.size());
+		grouping_set.insert(ProjectionIndex(agg_node->groups.size()));
 		agg_node->groups.push_back(std::move(group_expr));
 		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
 	}
@@ -128,22 +128,22 @@ static idx_t SemiAntiProbeChildIndex(JoinType join_type) {
 	return DConstants::INVALID_INDEX;
 }
 
-static unordered_set<idx_t> OutputTableIndexes(LogicalOperator &op) {
-	unordered_set<idx_t> result;
+static unordered_set<TableIndex> OutputTableIndexes(LogicalOperator &op) {
+	unordered_set<TableIndex> result;
 	for (auto &binding : op.GetColumnBindings()) {
 		result.insert(binding.table_index);
 	}
 	return result;
 }
 
-static unordered_set<idx_t> ExpressionTableIndexes(const Expression &expr) {
-	unordered_set<idx_t> result;
+static unordered_set<TableIndex> ExpressionTableIndexes(const Expression &expr) {
+	unordered_set<TableIndex> result;
 	LogicalJoin::GetExpressionBindings(expr, result);
 	return result;
 }
 
-static bool ExpressionUsesOnly(const Expression &expr, const unordered_set<idx_t> &table_indexes,
-                               bool allow_no_bindings = false) {
+static bool ExpressionUsesOnly(const Expression &expr, const unordered_set<TableIndex> &table_indexes,
+							       bool allow_no_bindings = false) {
 	auto bindings = ExpressionTableIndexes(expr);
 	if (bindings.empty()) {
 		return allow_no_bindings;
@@ -163,8 +163,8 @@ struct SemiAntiKeyReplacement {
 };
 
 static bool TryCollectSemiAntiKeyReplacement(ExpressionType comparison, const Expression &left, const Expression &right,
-                                             const unordered_set<idx_t> &source_bindings,
-                                             const unordered_set<idx_t> &delim_bindings,
+                                             const unordered_set<TableIndex> &source_bindings,
+                                             const unordered_set<TableIndex> &delim_bindings,
                                              vector<SemiAntiKeyReplacement> &replacements) {
 	if (comparison != ExpressionType::COMPARE_EQUAL && comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 		return false;
@@ -191,7 +191,7 @@ static bool TryCollectSemiAntiKeyReplacement(ExpressionType comparison, const Ex
 
 static unique_ptr<Expression> BuildIsNotNull(unique_ptr<Expression> child) {
 	auto is_not_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
-	is_not_null->children.push_back(std::move(child));
+		is_not_null->GetChildrenMutable().push_back(std::move(child));
 	return std::move(is_not_null);
 }
 
@@ -199,12 +199,12 @@ static bool IsEmptyJoinPredicate(const unique_ptr<Expression> &predicate) {
 	if (!predicate) {
 		return true;
 	}
-	if (predicate->type != ExpressionType::VALUE_CONSTANT) {
+	if (predicate->GetExpressionClass() != ExpressionClass::BOUND_CONSTANT) {
 		return false;
 	}
 	auto &constant = predicate->Cast<BoundConstantExpression>();
-	return !constant.value.IsNull() && constant.value.type().id() == LogicalTypeId::BOOLEAN &&
-	       constant.value.GetValue<bool>();
+	const auto &value = constant.GetValue();
+	return !value.IsNull() && value.type().id() == LogicalTypeId::BOOLEAN && value.GetValue<bool>();
 }
 
 // DuckDB decorrelates simple equality EXISTS/NOT EXISTS into a SEMI/ANTI join
@@ -266,12 +266,12 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 	vector<SemiAntiKeyReplacement> replacements;
 	if (inner.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 		auto &inner_join = inner.Cast<LogicalComparisonJoin>();
-		if (inner_join.join_type != JoinType::INNER || !IsEmptyJoinPredicate(inner_join.predicate)) {
+		if (inner_join.join_type != JoinType::INNER) {
 			return false;
 		}
 		for (auto &condition : inner_join.conditions) {
-			if (!condition.left || !condition.right ||
-			    !TryCollectSemiAntiKeyReplacement(condition.comparison, *condition.left, *condition.right,
+			if (!condition.LeftReference() || !condition.RightReference() ||
+			    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), condition.GetLHS(), condition.GetRHS(),
 			                                      source_bindings, delim_bindings, replacements)) {
 				return false;
 			}
@@ -283,9 +283,10 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 		if (!expr) {
 			return false;
 		}
-		if (expr->type == ExpressionType::COMPARE_EQUAL || expr->type == ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
-			auto &comparison = expr->Cast<BoundComparisonExpression>();
-			if (TryCollectSemiAntiKeyReplacement(comparison.type, *comparison.left, *comparison.right, source_bindings,
+		if (BoundComparisonExpression::IsComparison(*expr)) {
+			auto &comparison = expr->Cast<BoundFunctionExpression>();
+			if (TryCollectSemiAntiKeyReplacement(expr->GetExpressionType(), BoundComparisonExpression::Left(comparison),
+			                                     BoundComparisonExpression::Right(comparison), source_bindings,
 			                                     delim_bindings, replacements)) {
 				continue;
 			}
@@ -372,20 +373,20 @@ static bool RewriteSemiAntiProbeKeyProjections(unique_ptr<LogicalOperator> &node
 	return TryRewriteSemiAntiProbeKeyProjection(node) || rewritten;
 }
 
-static bool IsMarkColumnRef(const Expression &expr, idx_t mark_index) {
-	if (expr.type != ExpressionType::BOUND_COLUMN_REF) {
+static bool IsMarkColumnRef(const Expression &expr, TableIndex mark_index) {
+	if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &col_ref = expr.Cast<BoundColumnRefExpression>();
-	return col_ref.binding.table_index == mark_index && col_ref.binding.column_index == 0;
+	return col_ref.Binding().table_index == mark_index && col_ref.Binding().column_index == ProjectionIndex(0);
 }
 
-static bool IsNotMarkColumnRef(const Expression &expr, idx_t mark_index) {
-	if (expr.type != ExpressionType::OPERATOR_NOT) {
+static bool IsNotMarkColumnRef(const Expression &expr, TableIndex mark_index) {
+	if (expr.GetExpressionType() != ExpressionType::OPERATOR_NOT) {
 		return false;
 	}
 	auto &op = expr.Cast<BoundOperatorExpression>();
-	return op.children.size() == 1 && op.children[0] && IsMarkColumnRef(*op.children[0], mark_index);
+	return op.GetChildren().size() == 1 && op.GetChildren()[0] && IsMarkColumnRef(*op.GetChildren()[0], mark_index);
 }
 
 static bool MarkJoinCanBecomeSemiAnti(LogicalOperator &op) {
@@ -393,21 +394,21 @@ static bool MarkJoinCanBecomeSemiAnti(LogicalOperator &op) {
 		return false;
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
-	if (join.join_type != JoinType::MARK || join.conditions.empty() || join.predicate || !join.convert_mark_to_semi) {
+	if (join.join_type != JoinType::MARK || join.conditions.empty() || !join.convert_mark_to_semi) {
 		return false;
 	}
 	for (auto &condition : join.conditions) {
 		// Correlated EXISTS/NOT EXISTS MARK joins use null-safe delimiter comparisons.
 		// That guarantees the mark is TRUE/FALSE, not NULL, so filtering on mark is
 		// equivalent to SEMI/ANTI. Other MARK joins are left untouched.
-		if (condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		if (condition.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
 			return false;
 		}
 	}
 	return true;
 }
 
-static void CollectConvertibleMarkIndexes(LogicalOperator &op, unordered_set<idx_t> &mark_indexes) {
+static void CollectConvertibleMarkIndexes(LogicalOperator &op, unordered_set<TableIndex> &mark_indexes) {
 	if (MarkJoinCanBecomeSemiAnti(op)) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		mark_indexes.insert(join.mark_index);
@@ -419,9 +420,9 @@ static void CollectConvertibleMarkIndexes(LogicalOperator &op, unordered_set<idx
 	}
 }
 
-static bool IsConvertibleMarkPredicate(const Expression &expr, const unordered_set<idx_t> &mark_indexes) {
+static bool IsConvertibleMarkPredicate(const Expression &expr, const unordered_set<TableIndex> &mark_indexes) {
 	for (auto &mark_index : mark_indexes) {
-		if (IsMarkColumnRef(expr, mark_index) || IsNotMarkColumnRef(expr, mark_index)) {
+			if (IsMarkColumnRef(expr, mark_index) || IsNotMarkColumnRef(expr, mark_index)) {
 			return true;
 		}
 	}
@@ -450,7 +451,7 @@ static bool TryPushMarkFilterThroughSemiAnti(unique_ptr<LogicalOperator> &node) 
 	}
 	const idx_t preserved_child_idx = 1 - probe_child_idx;
 
-	unordered_set<idx_t> mark_indexes;
+	unordered_set<TableIndex> mark_indexes;
 	CollectConvertibleMarkIndexes(*join.children[preserved_child_idx], mark_indexes);
 	if (mark_indexes.empty()) {
 		return false;
@@ -592,7 +593,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 		return;
 	}
 	auto &cte = plan->Cast<LogicalMaterializedCTE>();
-	idx_t cte_index = cte.table_index;
+	TableIndex cte_index = cte.table_index;
 	// Definition is now fully inlined (recursion above ran on cte.children[0] too).
 	// Walk the consumer (cte.children[1]) and replace every CTE_REF with this
 	// cte_index with a fresh deep-copied + renumbered + passthrough-projected copy
@@ -620,7 +621,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 			for (idx_t i = 0; i < cols; i++) {
 				auto col_ref = make_uniq<BoundColumnRefExpression>(subtree_types[i], subtree_bindings[i]);
 				if (i < ref.bound_columns.size() && !ref.bound_columns[i].empty()) {
-					col_ref->alias = ref.bound_columns[i];
+		col_ref->SetAlias(Identifier(ref.bound_columns[i]));
 				}
 				proj_exprs.push_back(std::move(col_ref));
 			}
@@ -664,11 +665,11 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 // Replace every BoundColumnRef matching `target` in `expr` with a constant whose
 // foldable child references (those in `consts`) have been substituted first.
 static void SubstituteConstants(unique_ptr<Expression> &expr, const column_binding_map_t<Value> &consts) {
-	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		auto it = consts.find(bcr.binding);
+		auto it = consts.find(bcr.Binding());
 		if (it != consts.end()) {
-			expr = make_uniq<BoundConstantExpression>(it->second.DefaultCastAs(bcr.return_type));
+			expr = make_uniq<BoundConstantExpression>(it->second.DefaultCastAs(bcr.GetReturnType()));
 		}
 		return;
 	}
@@ -680,9 +681,9 @@ static void SubstituteConstants(unique_ptr<Expression> &expr, const column_bindi
 // taken branch is folded, so an untaken branch that is itself non-foldable — the
 // scalar-subquery guard's `error(...)` THEN branch — is never inspected.
 static bool TryFoldConstExpr(ClientContext &context, Expression &expr, Value &result) {
-	if (expr.type == ExpressionType::CASE_EXPR) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CASE) {
 		auto &case_expr = expr.Cast<BoundCaseExpression>();
-		for (auto &check : case_expr.case_checks) {
+		for (auto &check : case_expr.CaseChecks()) {
 			Value cond;
 			if (!TryFoldConstExpr(context, *check.when_expr, cond)) {
 				return false;
@@ -691,7 +692,7 @@ static bool TryFoldConstExpr(ClientContext &context, Expression &expr, Value &re
 				return TryFoldConstExpr(context, *check.then_expr, result);
 			}
 		}
-		return TryFoldConstExpr(context, *case_expr.else_expr, result);
+		return TryFoldConstExpr(context, *case_expr.ElseExpression(), result);
 	}
 	if (expr.IsVolatile() || !expr.IsFoldable()) {
 		return false;
@@ -712,7 +713,7 @@ static bool SubstituteAndFold(ClientContext &context, const Expression &expr, co
 // column bindings to its Value. Returns false (leaving the plan untouched) on
 // anything not provably constant.
 static bool TryEvalConstantSubtree(ClientContext &context, LogicalOperator &node, column_binding_map_t<Value> &out,
-                                   const unordered_map<idx_t, LogicalOperator *> &cte_defs) {
+                                   const unordered_map<TableIndex, LogicalOperator *> &cte_defs) {
 	switch (node.type) {
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
 		return true; // one row, no columns
@@ -736,7 +737,7 @@ static bool TryEvalConstantSubtree(ClientContext &context, LogicalOperator &node
 			if (vit == def_out.end()) {
 				return false;
 			}
-			out[ColumnBinding(ref.table_index, i)] = vit->second;
+			out[ColumnBinding(ref.table_index, ProjectionIndex(i))] = vit->second;
 		}
 		return true;
 	}
@@ -754,7 +755,7 @@ static bool TryEvalConstantSubtree(ClientContext &context, LogicalOperator &node
 			if (!SubstituteAndFold(context, *proj.expressions[i], child, v)) {
 				return false;
 			}
-			out[ColumnBinding(proj.table_index, i)] = std::move(v);
+			out[ColumnBinding(proj.table_index, ProjectionIndex(i))] = std::move(v);
 		}
 		return true;
 	}
@@ -769,24 +770,24 @@ static bool TryEvalConstantSubtree(ClientContext &context, LogicalOperator &node
 			return false;
 		}
 		for (idx_t i = 0; i < agg.expressions.size(); i++) {
-			if (agg.expressions[i]->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			if (agg.expressions[i]->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 				return false;
 			}
 			auto &bound_agg = agg.expressions[i]->Cast<BoundAggregateExpression>();
-			if (bound_agg.filter) {
+			if (bound_agg.GetFilter()) {
 				return false;
 			}
 			Value v;
-			if (bound_agg.function.name == "count_star" && bound_agg.children.empty()) {
+			if (bound_agg.Function().GetName() == "count_star" && bound_agg.GetChildren().empty()) {
 				v = Value::BIGINT(1); // constant subtree is exactly one row
-			} else if (bound_agg.function.name == "first" && bound_agg.children.size() == 1) {
-				if (!SubstituteAndFold(context, *bound_agg.children[0], child, v)) {
+			} else if (bound_agg.Function().GetName() == "first" && bound_agg.GetChildren().size() == 1) {
+				if (!SubstituteAndFold(context, *bound_agg.GetChildren()[0], child, v)) {
 					return false;
 				}
 			} else {
 				return false; // any other aggregate: not a constant scalar guard
 			}
-			out[ColumnBinding(agg.aggregate_index, i)] = std::move(v);
+			out[ColumnBinding(agg.aggregate_index, ProjectionIndex(i))] = std::move(v);
 		}
 		return true;
 	}
@@ -802,9 +803,9 @@ public:
 	}
 	using LogicalOperatorVisitor::VisitReplace;
 	unique_ptr<Expression> VisitReplace(BoundColumnRefExpression &expr, unique_ptr<Expression> *expr_ptr) override {
-		auto entry = values.find(expr.binding);
+		auto entry = values.find(expr.Binding());
 		if (entry != values.end()) {
-			return make_uniq<BoundConstantExpression>(entry->second.DefaultCastAs(expr.return_type));
+			return make_uniq<BoundConstantExpression>(entry->second.DefaultCastAs(expr.GetReturnType()));
 		}
 		return nullptr;
 	}
@@ -818,7 +819,7 @@ private:
 // cross product. Returns true if a fold was applied.
 static bool FoldConstantScalarSubqueriesOnce(ClientContext &context, unique_ptr<LogicalOperator> &root,
                                              unique_ptr<LogicalOperator> &node,
-                                             const unordered_map<idx_t, LogicalOperator *> &cte_defs) {
+                                             const unordered_map<TableIndex, LogicalOperator *> &cte_defs) {
 	for (auto &c : node->children) {
 		if (FoldConstantScalarSubqueriesOnce(context, root, c, cte_defs)) {
 			return true;
@@ -854,7 +855,7 @@ static bool FoldConstantScalarSubqueriesOnce(ClientContext &context, unique_ptr<
 			D_ASSERT(value != values.end());
 			OPENIVM_DEBUG_PRINT("[PlanRewrite] Folded constant scalar subquery "
 			                    "binding (%lu.%lu) = %s\n",
-			                    (unsigned long)b.table_index, (unsigned long)b.column_index,
+					(unsigned long)b.table_index.index, (unsigned long)b.column_index.GetIndexUnsafe(),
 			                    value->second.ToString().c_str());
 		}
 		node = std::move(node->children[1 - side]); // keep the real input, drop the cross product
@@ -870,7 +871,7 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 	// Map cte_index -> definition subtree so scalar subqueries that bottom out in a
 	// CTE_REF (the full CREATE plan keeps multi-referenced CTEs materialized) can still
 	// be resolved to a constant.
-	unordered_map<idx_t, LogicalOperator *> cte_defs;
+	unordered_map<TableIndex, LogicalOperator *> cte_defs;
 	std::function<void(LogicalOperator &)> collect = [&](LogicalOperator &n) {
 		if (n.type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && n.children.size() == 2) {
 			cte_defs[n.Cast<LogicalMaterializedCTE>().table_index] = n.children[0].get();
@@ -889,15 +890,15 @@ void FoldConstantScalarSubqueries(ClientContext &context, unique_ptr<LogicalOper
 static ColumnBinding AppendProjectionPassthrough(LogicalProjection &proj, const ColumnBinding &binding,
                                                  const LogicalType &type, const string &alias) {
 	auto passthrough = make_uniq<BoundColumnRefExpression>(type, binding);
-	passthrough->alias = alias;
+	passthrough->SetAlias(Identifier(alias));
 	proj.expressions.push_back(std::move(passthrough));
 	// Projection types depend only on the bound expressions, not a recursive
 	// resolution of its entire child plan for every appended helper column.
 	proj.types.clear();
 	for (auto &expression : proj.expressions) {
-		proj.types.push_back(expression->return_type);
+		proj.types.push_back(expression->GetReturnType());
 	}
-	return ColumnBinding(proj.table_index, proj.expressions.size() - 1);
+	return ColumnBinding(proj.table_index, ProjectionIndex(proj.expressions.size() - 1));
 }
 
 void PropagateHiddenBindingThroughProjectionPath(vector<LogicalProjection *> &projection_path, ColumnBinding binding,
@@ -931,8 +932,8 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 	}
 	auto &aggregate = node->Cast<LogicalAggregate>();
 	for (idx_t i = 0; i < aggregate.groups.size(); i++) {
-		ColumnBinding binding(aggregate.group_index, i);
-		auto type = aggregate.groups[i]->return_type;
+		ColumnBinding binding(aggregate.group_index, ProjectionIndex(i));
+		auto type = aggregate.groups[i]->GetReturnType();
 		auto alias = "openivm_group_key_" + to_string(i);
 		for (auto it = projections.rbegin(); it != projections.rend(); ++it) {
 			auto &projection = **it;
@@ -940,7 +941,7 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 			for (; column < projection.expressions.size(); column++) {
 				auto &expression = *projection.expressions[column];
 				if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
-				    expression.Cast<BoundColumnRefExpression>().binding == binding) {
+				    expression.Cast<BoundColumnRefExpression>().Binding() == binding) {
 					break;
 				}
 			}
@@ -948,7 +949,7 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 				binding = AppendProjectionPassthrough(projection, binding, type, alias);
 				OPENIVM_DEBUG_PRINT("[PlanRewrite] Preserving hidden group key %s\n", alias.c_str());
 			} else {
-				binding = ColumnBinding(projection.table_index, column);
+				binding = ColumnBinding(projection.table_index, ProjectionIndex(column));
 			}
 		}
 	}
@@ -969,7 +970,7 @@ void InjectHiddenGroupKeys(unique_ptr<LogicalOperator> &plan) {
 /// The column is prefixed `openivm_` so `column_hider` auto-excludes it from
 /// the user-facing VIEW; `CompileAggregateGroups` already recognizes it
 /// via openivm::COUNT_STAR_COL.
-static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
+static void InjectGroupCountStar(ClientContext &context, unique_ptr<LogicalOperator> &plan) {
 	// Only inject into the aggregate on the top-level output path. ORDER BY/LIMIT/TOP_N
 	// preserve the projection schema; inner aggregates under joins or set operations
 	// are handled by other refresh strategies.
@@ -1020,19 +1021,20 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	//     pass (e.g. DISTINCT rewrite).
 	bool has_argminmax = false;
 	for (auto &expr : agg.expressions) {
-		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 			continue;
 		}
 		auto &bound = expr->Cast<BoundAggregateExpression>();
 		// True COUNT(*): no-arg, no filter — always equals the group cardinality.
-		if (bound.function.name == "count_star" && bound.children.empty() && !bound.filter) {
+		if (bound.Function().GetName() == "count_star" && bound.GetChildren().empty() && !bound.GetFilter()) {
 			return;
 		}
 		// Already-injected reliable hidden count.
-		if (bound.alias == openivm::COUNT_STAR_COL || bound.alias == openivm::DISTINCT_COUNT_COL) {
+		const auto &alias = bound.GetAlias().GetIdentifierName();
+		if (alias == openivm::COUNT_STAR_COL || alias == openivm::DISTINCT_COUNT_COL) {
 			return;
 		}
-		if (bound.function.name == "arg_min" || bound.function.name == "arg_max") {
+		if (bound.Function().GetName() == "arg_min" || bound.Function().GetName() == "arg_max") {
 			has_argminmax = true;
 		}
 	}
@@ -1045,15 +1047,14 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
 	}
 	auto count_star_func = CountStarFun::GetFunction();
 	vector<unique_ptr<Expression>> count_args;
-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
-	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = openivm::COUNT_STAR_COL;
-	auto count_type = count_expr->return_type;
+	auto count_expr = count_star_func.Bind(context, std::move(count_args));
+	count_expr->SetAlias(Identifier(openivm::COUNT_STAR_COL));
+	auto count_type = count_expr->GetReturnType();
 	idx_t new_agg_idx = agg.expressions.size();
 	agg.expressions.push_back(std::move(count_expr));
 	agg.ResolveOperatorTypes();
 
-	ColumnBinding count_binding(agg.aggregate_index, new_agg_idx);
+	ColumnBinding count_binding(agg.aggregate_index, ProjectionIndex(new_agg_idx));
 	PropagateHiddenBindingThroughProjectionPath(projection_path, count_binding, count_type, openivm::COUNT_STAR_COL);
 	plan->ResolveOperatorTypes();
 
@@ -1095,8 +1096,9 @@ void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 
 	std::set<string> already_present;
 	for (auto &expr : proj.expressions) {
-		if (IsHiddenAggregateAlias(expr->alias)) {
-			already_present.insert(expr->alias);
+		const auto &alias = expr->GetAlias().GetIdentifierName();
+		if (IsHiddenAggregateAlias(alias)) {
+			already_present.insert(alias);
 		}
 	}
 
@@ -1106,7 +1108,7 @@ void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 
 	bool added = false;
 	for (idx_t i = 0; i < child_proj.expressions.size(); i++) {
-		const string &child_alias = child_proj.expressions[i]->alias;
+		const auto &child_alias = child_proj.expressions[i]->GetAlias().GetIdentifierName();
 		if (!IsHiddenAggregateAlias(child_alias) || already_present.count(child_alias)) {
 			continue;
 		}
@@ -1114,7 +1116,7 @@ void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
 			continue;
 		}
 		auto bcr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
-		bcr->alias = child_alias;
+		bcr->SetAlias(Identifier(child_alias));
 		proj.expressions.push_back(std::move(bcr));
 		added = true;
 		OPENIVM_DEBUG_PRINT("[PropagateHidden] Added '%s' to parent projection "
@@ -1144,12 +1146,12 @@ static bool IsOuterJoin(JoinType join_type) {
 }
 
 static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBinding &binding, LogicalType &type) {
-	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+	if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return;
 	}
 	auto &ref = expr->Cast<BoundColumnRefExpression>();
-	binding = ref.binding;
-	type = ref.return_type;
+	binding = ref.Binding();
+	type = ref.GetReturnType();
 }
 
 static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
@@ -1163,13 +1165,13 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
 				bindings.found = true;
 				bindings.is_full_outer = join.join_type == JoinType::OUTER;
 
-				auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.right : condition.left;
+					auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.RightReference() : condition.LeftReference();
 				ReadColumnRefBinding(preserved_key, bindings.preserved_key_binding, bindings.preserved_key_type);
-				ReadColumnRefBinding(condition.right, bindings.right_key_binding, bindings.right_key_type);
+					ReadColumnRefBinding(condition.RightReference(), bindings.right_key_binding, bindings.right_key_type);
 
-				auto &null_side = join.join_type == JoinType::RIGHT ? condition.left : condition.right;
+					auto &null_side = join.join_type == JoinType::RIGHT ? condition.LeftReference() : condition.RightReference();
 				ReadColumnRefBinding(null_side, bindings.null_side_binding, bindings.null_side_type);
-				ReadColumnRefBinding(condition.left, bindings.left_side_binding, bindings.left_side_type);
+					ReadColumnRefBinding(condition.LeftReference(), bindings.left_side_binding, bindings.left_side_type);
 				return true;
 			}
 		}
@@ -1226,12 +1228,12 @@ static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &pla
 			auto &projection = entry.op->Cast<LogicalProjection>();
 			bool found = false;
 			for (idx_t i = 0; i < projection.expressions.size(); i++) {
-				if (projection.expressions[i]->type != ExpressionType::BOUND_COLUMN_REF) {
+				if (projection.expressions[i]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 					continue;
 				}
 				auto &ref = projection.expressions[i]->Cast<BoundColumnRefExpression>();
-				if (ref.binding == current) {
-					current = ColumnBinding(projection.table_index, i);
+				if (ref.Binding() == current) {
+				current = ColumnBinding(projection.table_index, ProjectionIndex(i));
 					found = true;
 					break;
 				}
@@ -1239,7 +1241,7 @@ static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &pla
 			if (!found) {
 				auto col_ref = make_uniq<BoundColumnRefExpression>(type, current);
 				projection.expressions.push_back(std::move(col_ref));
-				current = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
+				current = ColumnBinding(projection.table_index, ProjectionIndex(projection.expressions.size() - 1));
 			}
 			projection.ResolveOperatorTypes();
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
@@ -1299,7 +1301,7 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	}
 
 	// Use a table index that won't conflict (high number)
-	idx_t proj_table_index = binder.GenerateTableIndex();
+	TableIndex proj_table_index = binder.GenerateTableIndex();
 	auto projection = make_uniq<LogicalProjection>(proj_table_index, std::move(proj_exprs));
 	projection->children.push_back(std::move(plan));
 	projection->ResolveOperatorTypes();
@@ -1346,9 +1348,8 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	auto count_func = BindAggregateByName(context, "count", {null_side_type});
 	vector<unique_ptr<Expression>> count_args;
 	count_args.push_back(make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding));
-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
-	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = string(openivm::MATCH_COUNT_COL);
+	auto count_expr = count_func.Bind(context, std::move(count_args));
+				count_expr->SetAlias(Identifier(openivm::MATCH_COUNT_COL));
 	idx_t match_count_idx = agg.expressions.size();
 	agg.expressions.push_back(std::move(count_expr));
 
@@ -1358,9 +1359,8 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 		auto right_count_func = BindAggregateByName(context, "count", {left_side_type});
 		vector<unique_ptr<Expression>> right_count_args;
 		right_count_args.push_back(make_uniq<BoundColumnRefExpression>(left_side_type, left_side_binding));
-		auto right_count_expr = make_uniq<BoundAggregateExpression>(
-		    std::move(right_count_func), std::move(right_count_args), nullptr, nullptr, AggregateType::NON_DISTINCT);
-		right_count_expr->alias = string(openivm::RIGHT_MATCH_COUNT_COL);
+		auto right_count_expr = right_count_func.Bind(context, std::move(right_count_args));
+		right_count_expr->SetAlias(Identifier(openivm::RIGHT_MATCH_COUNT_COL));
 		right_match_count_idx = agg.expressions.size();
 		agg.expressions.push_back(std::move(right_count_expr));
 	}
@@ -1460,7 +1460,7 @@ static void RewritePassDerivedAggregates(PlanRewriteContext &rewrite_context) {
 
 static void RewritePassGroupCountStar(PlanRewriteContext &rewrite_context) {
 	InjectHiddenGroupKeys(rewrite_context.plan);
-	InjectGroupCountStar(rewrite_context.plan);
+	InjectGroupCountStar(rewrite_context.context, rewrite_context.plan);
 }
 
 static void RewritePassHiddenAggregatePropagation(PlanRewriteContext &rewrite_context) {
@@ -1473,16 +1473,17 @@ static void RewritePassOuterJoinSupport(PlanRewriteContext &rewrite_context) {
 }
 
 bool IsRunningWindowCandidate(const BoundWindowExpression &window) {
-	if (!window.aggregate || window.partitions.size() != 1 || window.orders.size() != 1 ||
-	    window.orders[0].type != OrderType::ASCENDING || window.filter_expr || window.distinct ||
-	    !window.arg_orders.empty() || window.exclude_clause != WindowExcludeMode::NO_OTHER ||
-	    window.start != WindowBoundary::UNBOUNDED_PRECEDING ||
-	    (window.end != WindowBoundary::CURRENT_ROW_ROWS && window.end != WindowBoundary::CURRENT_ROW_RANGE) ||
-	    window.orders[0].expression->expression_class != ExpressionClass::BOUND_COLUMN_REF ||
-	    window.partitions[0]->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+	if (!window.AggregateFunction() || window.Partitions().size() != 1 || window.OrderBy().size() != 1 ||
+	    window.OrderBy()[0].type != OrderType::ASCENDING || window.Filter() || window.Distinct() ||
+	    !window.ArgOrders().empty() || window.WindowExclude() != WindowExcludeMode::NO_OTHER ||
+	    window.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
+	    (window.WindowEnd() != WindowBoundary::CURRENT_ROW_ROWS &&
+	     window.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE) ||
+	    window.OrderBy()[0].expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+	    window.Partitions()[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
 	}
-	auto &name = window.aggregate->name;
+	auto &name = window.AggregateFunction()->GetName();
 	return name == "sum" || name == "min" || name == "max" || name == "count" || name == "count_star" || name == "avg";
 }
 
@@ -1493,26 +1494,26 @@ static void RewritePassRunningWindowState(PlanRewriteContext &context) {
 	idx_t position_count = 0, input_count = 0;
 	bool changed = false;
 	auto expose_input = [&](const Expression &expression) {
-		if (expression.expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+		if (expression.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 			return;
 		}
-		auto binding = expression.Cast<BoundColumnRefExpression>().binding;
+		auto binding = expression.Cast<BoundColumnRefExpression>().Binding();
 		auto alias = string(openivm::RUNNING_INPUT_PREFIX) + to_string(input_count++);
 		for (auto it = projections.rbegin(); it != projections.rend(); ++it) {
 			auto &projection = **it;
 			idx_t index = 0;
 			for (; index < projection.expressions.size(); index++) {
 				auto &item = *projection.expressions[index];
-				if (item.expression_class == ExpressionClass::BOUND_COLUMN_REF &&
-				    item.Cast<BoundColumnRefExpression>().binding == binding) {
+				if (item.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+				    item.Cast<BoundColumnRefExpression>().Binding() == binding) {
 					break;
 				}
 			}
 			if (index == projection.expressions.size()) {
-				AppendProjectionPassthrough(projection, binding, expression.return_type, alias);
+				AppendProjectionPassthrough(projection, binding, expression.GetReturnType(), alias);
 				changed = true;
 			}
-			binding = ColumnBinding(projection.table_index, index);
+			binding = ColumnBinding(projection.table_index, ProjectionIndex(index));
 		}
 	};
 	std::function<bool(LogicalOperator &)> visit = [&](LogicalOperator &node) {
@@ -1546,24 +1547,23 @@ static void RewritePassRunningWindowState(PlanRewriteContext &context) {
 			auto expression_count = window.expressions.size();
 			for (idx_t i = 0; i < expression_count; i++) {
 				auto &expression = window.expressions[i]->Cast<BoundWindowExpression>();
-				expose_input(*expression.orders[0].expression);
-				if (expression.aggregate->name == "avg" && expression.children.size() == 1) {
-					expose_input(*expression.children[0]);
+				expose_input(*expression.OrderBy()[0].expression);
+				if (expression.AggregateFunction()->GetName() == "avg" && expression.GetChildren().size() == 1) {
+					expose_input(*expression.GetChildren()[0]);
 				}
-				if (expression.end != WindowBoundary::CURRENT_ROW_ROWS || have_position) {
+				if (expression.WindowEnd() != WindowBoundary::CURRENT_ROW_ROWS || have_position) {
 					continue;
 				}
 				have_position = true;
-				auto position = make_uniq<BoundWindowExpression>(ExpressionType::WINDOW_ROW_NUMBER, LogicalType::BIGINT,
-				                                                 nullptr, nullptr);
-				position->partitions.push_back(expression.partitions[0]->Copy());
-				position->partitions_stats.push_back(nullptr);
-				position->orders.push_back(expression.orders[0].Copy());
-				position->start = WindowBoundary::UNBOUNDED_PRECEDING;
-				position->end = WindowBoundary::CURRENT_ROW_ROWS;
+				auto position = RowNumberFun::GetFunction().Bind(context.context);
+				position->PartitionsMutable().push_back(expression.Partitions()[0]->Copy());
+				position->PartitionsStatsMutable().push_back(nullptr);
+				position->OrderByMutable().push_back(expression.OrderBy()[0].Copy());
+				position->WindowStartMutable() = WindowBoundary::UNBOUNDED_PRECEDING;
+				position->WindowEndMutable() = WindowBoundary::CURRENT_ROW_ROWS;
 				auto alias = string(openivm::ROWS_POSITION_PREFIX) + to_string(position_count++);
-				position->alias = alias;
-				ColumnBinding binding(window.window_index, window.expressions.size());
+				position->SetAlias(Identifier(alias));
+				ColumnBinding binding(window.window_index, ProjectionIndex(window.expressions.size()));
 				window.expressions.push_back(std::move(position));
 				PropagateHiddenBindingThroughProjectionPath(projections, binding, LogicalType::BIGINT, alias);
 				changed = true;
@@ -1583,7 +1583,7 @@ static void RewritePassRunningWindowState(PlanRewriteContext &context) {
 
 static void RewritePassSemiAntiSubqueries(PlanRewriteContext &rewrite_context) {
 	if (RewriteMarkJoinFilters(rewrite_context.plan)) {
-		Deliminator deliminator;
+		Deliminator deliminator(rewrite_context.context);
 		rewrite_context.plan = deliminator.Optimize(std::move(rewrite_context.plan));
 	}
 	RewriteSafeSemiAntiDelimGets(rewrite_context.context, rewrite_context.plan);
@@ -1623,33 +1623,34 @@ void PlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOpera
 }
 
 static uint64_t DerivedOutputBindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+	return (uint64_t)binding.table_index.index ^
+	       ((uint64_t)binding.column_index.GetIndexUnsafe() * 0x9e3779b97f4a7c15ULL);
 }
 
-using DerivedOutputProjectionMap = unordered_map<idx_t, const LogicalProjection *>;
+using DerivedOutputProjectionMap = unordered_map<TableIndex, const LogicalProjection *>;
 
 static const Expression *ResolveDerivedOutputPassThrough(const Expression &expr,
                                                          const DerivedOutputProjectionMap &projections,
                                                          vector<uint64_t> *binding_path = nullptr) {
 	auto current = &expr;
 	unordered_set<uint64_t> visited;
-	while (current->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+	while (current->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column = current->Cast<BoundColumnRefExpression>();
-		auto key = DerivedOutputBindingKey(column.binding);
+		auto key = DerivedOutputBindingKey(column.Binding());
 		if (!visited.insert(key).second) {
 			return nullptr;
 		}
 		if (binding_path) {
 			binding_path->push_back(key);
 		}
-		auto projection = projections.find(column.binding.table_index);
+		auto projection = projections.find(column.Binding().table_index);
 		if (projection == projections.end()) {
 			return current;
 		}
-		if (column.binding.column_index >= projection->second->expressions.size()) {
+		if (column.Binding().column_index >= projection->second->expressions.size()) {
 			return nullptr;
 		}
-		current = projection->second->expressions[column.binding.column_index].get();
+		current = projection->second->expressions[column.Binding().column_index].get();
 	}
 	return current;
 }
@@ -1670,10 +1671,34 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
                                           const DerivedOutputProjectionMap &projections,
                                           unordered_set<uint64_t> &active_bindings, string &sql,
                                           bool allow_functions = false) {
-	switch (expr.expression_class) {
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		auto &comparison = expr.Cast<BoundFunctionExpression>();
+		string left_sql;
+		string right_sql;
+		if (!RenderDerivedOutputExpression(BoundComparisonExpression::Left(comparison), binding_to_column, projections,
+		                                   active_bindings, left_sql, allow_functions) ||
+		    !RenderDerivedOutputExpression(BoundComparisonExpression::Right(comparison), binding_to_column, projections,
+		                                   active_bindings, right_sql, allow_functions)) {
+			return false;
+		}
+		sql = "(" + left_sql + " " + ExpressionTypeToOperator(expr.GetExpressionType()) + " " + right_sql + ")";
+		return true;
+	}
+	if (BoundCastExpression::IsCast(expr)) {
+		auto &cast = expr.Cast<BoundFunctionExpression>();
+		string child_sql;
+		if (!RenderDerivedOutputExpression(BoundCastExpression::Child(cast), binding_to_column, projections,
+		                                   active_bindings, child_sql, allow_functions)) {
+			return false;
+		}
+		sql = string(BoundCastExpression::IsTryCast(cast) ? "TRY_CAST(" : "CAST(") + child_sql + " AS " +
+		      BoundCastExpression::TargetType(cast).ToString() + ")";
+		return true;
+	}
+	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		auto &column = expr.Cast<BoundColumnRefExpression>();
-		auto key = DerivedOutputBindingKey(column.binding);
+		auto key = DerivedOutputBindingKey(column.Binding());
 		auto entry = binding_to_column.find(key);
 		if (entry != binding_to_column.end()) {
 			// Always quote references in the persisted expression. The refresh
@@ -1683,13 +1708,13 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 			sql = QuoteDerivedOutputIdentifier(entry->second);
 			return true;
 		}
-		auto projection = projections.find(column.binding.table_index);
-		if (projection == projections.end() || column.binding.column_index >= projection->second->expressions.size() ||
+		auto projection = projections.find(column.Binding().table_index);
+		if (projection == projections.end() || column.Binding().column_index >= projection->second->expressions.size() ||
 		    !active_bindings.insert(key).second) {
 			return false;
 		}
 		bool rendered =
-		    RenderDerivedOutputExpression(*projection->second->expressions[column.binding.column_index],
+		    RenderDerivedOutputExpression(*projection->second->expressions[column.Binding().column_index],
 		                                  binding_to_column, projections, active_bindings, sql, allow_functions);
 		active_bindings.erase(key);
 		return rendered;
@@ -1700,7 +1725,7 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 		}
 		auto &function = expr.Cast<BoundFunctionExpression>();
 		vector<string> children;
-		for (auto &child : function.children) {
+		for (auto &child : function.GetChildren()) {
 			string child_sql;
 			if (!RenderDerivedOutputExpression(*child, binding_to_column, projections, active_bindings, child_sql,
 			                                   allow_functions)) {
@@ -1708,7 +1733,7 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 			}
 			children.push_back(std::move(child_sql));
 		}
-		const auto &name = function.function.name;
+		const auto &name = function.Function().GetName().GetIdentifierName();
 		if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
 			sql = "(" + children[0] + " " + name + " " + children[1] + ")";
 		} else {
@@ -1717,12 +1742,12 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 		return true;
 	}
 	case ExpressionClass::BOUND_CONSTANT:
-		sql = expr.Cast<BoundConstantExpression>().value.ToSQLString();
+		sql = expr.Cast<BoundConstantExpression>().GetValue().ToSQLString();
 		return true;
 	case ExpressionClass::BOUND_CASE: {
 		auto &case_expr = expr.Cast<BoundCaseExpression>();
 		sql = "CASE";
-		for (auto &check : case_expr.case_checks) {
+		for (auto &check : case_expr.CaseChecks()) {
 			string when_sql;
 			string then_sql;
 			if (!RenderDerivedOutputExpression(*check.when_expr, binding_to_column, projections, active_bindings,
@@ -1734,33 +1759,20 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 			sql += " WHEN " + when_sql + " THEN " + then_sql;
 		}
 		string else_sql;
-		if (!RenderDerivedOutputExpression(*case_expr.else_expr, binding_to_column, projections, active_bindings,
+		if (!RenderDerivedOutputExpression(*case_expr.ElseExpression(), binding_to_column, projections, active_bindings,
 		                                   else_sql, allow_functions)) {
 			return false;
 		}
 		sql += " ELSE " + else_sql + " END";
 		return true;
 	}
-	case ExpressionClass::BOUND_COMPARISON: {
-		auto &comparison = expr.Cast<BoundComparisonExpression>();
-		string left_sql;
-		string right_sql;
-		if (!RenderDerivedOutputExpression(*comparison.left, binding_to_column, projections, active_bindings, left_sql,
-		                                   allow_functions) ||
-		    !RenderDerivedOutputExpression(*comparison.right, binding_to_column, projections, active_bindings,
-		                                   right_sql, allow_functions)) {
-			return false;
-		}
-		sql = "(" + left_sql + " " + ExpressionTypeToOperator(comparison.type) + " " + right_sql + ")";
-		return true;
-	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conjunction = expr.Cast<BoundConjunctionExpression>();
-		string op = conjunction.type == ExpressionType::CONJUNCTION_AND ? " AND " : " OR ";
+		string op = expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND ? " AND " : " OR ";
 		sql = "(";
-		for (idx_t i = 0; i < conjunction.children.size(); i++) {
+		for (idx_t i = 0; i < conjunction.GetChildren().size(); i++) {
 			string child_sql;
-			if (!RenderDerivedOutputExpression(*conjunction.children[i], binding_to_column, projections,
+			if (!RenderDerivedOutputExpression(*conjunction.GetChildren()[i], binding_to_column, projections,
 			                                   active_bindings, child_sql, allow_functions)) {
 				return false;
 			}
@@ -1774,37 +1786,27 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 	}
 	case ExpressionClass::BOUND_OPERATOR: {
 		auto &op = expr.Cast<BoundOperatorExpression>();
-		if (op.children.size() != 1) {
+		if (op.GetChildren().size() != 1) {
 			return false;
 		}
 		string child_sql;
-		if (!RenderDerivedOutputExpression(*op.children[0], binding_to_column, projections, active_bindings, child_sql,
+		if (!RenderDerivedOutputExpression(*op.GetChildren()[0], binding_to_column, projections, active_bindings, child_sql,
 		                                   allow_functions)) {
 			return false;
 		}
-		if (expr.type == ExpressionType::OPERATOR_IS_NULL) {
+		if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
 			sql = "(" + child_sql + " IS NULL)";
 			return true;
 		}
-		if (expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
 			sql = "(" + child_sql + " IS NOT NULL)";
 			return true;
 		}
-		if (expr.type == ExpressionType::OPERATOR_NOT) {
+		if (expr.GetExpressionType() == ExpressionType::OPERATOR_NOT) {
 			sql = "(NOT " + child_sql + ")";
 			return true;
 		}
 		return false;
-	}
-	case ExpressionClass::BOUND_CAST: {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		string child_sql;
-		if (!RenderDerivedOutputExpression(*cast.child, binding_to_column, projections, active_bindings, child_sql,
-		                                   allow_functions)) {
-			return false;
-		}
-		sql = string(cast.try_cast ? "TRY_CAST(" : "CAST(") + child_sql + " AS " + cast.return_type.ToString() + ")";
-		return true;
 	}
 	default:
 		return false;
@@ -1834,7 +1836,7 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 	// that equivalence only for group keys present in the published output.
 	for (auto *aggregate : facts.aggregates) {
 		for (idx_t i = 0; i < aggregate->groups.size(); i++) {
-			auto key = DerivedOutputBindingKey(ColumnBinding(aggregate->group_index, i));
+			auto key = DerivedOutputBindingKey(ColumnBinding(aggregate->group_index, ProjectionIndex(i)));
 			auto entry = binding_to_column.find(key);
 			if (entry == binding_to_column.end()) {
 				continue;
@@ -1877,7 +1879,7 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 			return info;
 		}
 		resolved_expressions.push_back(resolved);
-		if (resolved->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+		if (resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 			for (auto key : binding_path) {
 				binding_to_column[key] = output_names[i];
 			}
@@ -1885,7 +1887,7 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 	}
 	for (idx_t i = 0; i < resolved_expressions.size(); i++) {
 		auto &expression = *resolved_expressions[i];
-		if (expression.expression_class == ExpressionClass::BOUND_COLUMN_REF ||
+		if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF ||
 		    IncrementalTableNames::IsInternalColumn(output_names[i])) {
 			continue;
 		}
@@ -1912,38 +1914,45 @@ DerivedAggregateOutputInfo ExtractDerivedAggregateOutputs(const LogicalOperator 
 
 /// Convert a FILTER condition to SQL using output column aliases.
 static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64_t, string> &binding_to_alias) {
-	switch (expr.expression_class) {
+	if (BoundComparisonExpression::IsComparison(expr)) {
+		auto &comp = expr.Cast<BoundFunctionExpression>();
+		return "(" + HavingExprToSQL(BoundComparisonExpression::Left(comp), binding_to_alias) + " " +
+		       ExpressionTypeToOperator(expr.GetExpressionType()) + " " +
+		       HavingExprToSQL(BoundComparisonExpression::Right(comp), binding_to_alias) + ")";
+	}
+	if (BoundCastExpression::IsCast(expr)) {
+		auto &cast = expr.Cast<BoundFunctionExpression>();
+		return string(BoundCastExpression::IsTryCast(cast) ? "TRY_CAST(" : "CAST(") +
+		       HavingExprToSQL(BoundCastExpression::Child(cast), binding_to_alias) + " AS " +
+		       BoundCastExpression::TargetType(cast).ToString() + ")";
+	}
+	switch (expr.GetExpressionClass()) {
 	case ExpressionClass::BOUND_COLUMN_REF: {
 		auto &col = expr.Cast<BoundColumnRefExpression>();
-		uint64_t key = (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
+		uint64_t key = DerivedOutputBindingKey(col.Binding());
 		auto it = binding_to_alias.find(key);
 		return (it != binding_to_alias.end()) ? it->second : col.ToString();
 	}
-	case ExpressionClass::BOUND_COMPARISON: {
-		auto &comp = expr.Cast<BoundComparisonExpression>();
-		return "(" + HavingExprToSQL(*comp.left, binding_to_alias) + " " + ExpressionTypeToOperator(comp.type) + " " +
-		       HavingExprToSQL(*comp.right, binding_to_alias) + ")";
-	}
 	case ExpressionClass::BOUND_CONSTANT: {
-		return expr.Cast<BoundConstantExpression>().value.ToSQLString();
+		return expr.Cast<BoundConstantExpression>().GetValue().ToSQLString();
 	}
 	case ExpressionClass::BOUND_CASE: {
 		auto &case_expr = expr.Cast<BoundCaseExpression>();
 		string result = "CASE";
-		for (auto &check : case_expr.case_checks) {
+		for (auto &check : case_expr.CaseChecks()) {
 			result += " WHEN " + HavingExprToSQL(*check.when_expr, binding_to_alias) + " THEN " +
 			          HavingExprToSQL(*check.then_expr, binding_to_alias);
 		}
-		return result + " ELSE " + HavingExprToSQL(*case_expr.else_expr, binding_to_alias) + " END";
+		return result + " ELSE " + HavingExprToSQL(*case_expr.ElseExpression(), binding_to_alias) + " END";
 	}
 	case ExpressionClass::BOUND_FUNCTION: {
 		auto &function = expr.Cast<BoundFunctionExpression>();
 		vector<string> children;
-		children.reserve(function.children.size());
-		for (auto &child : function.children) {
+		children.reserve(function.GetChildren().size());
+		for (auto &child : function.GetChildren()) {
 			children.push_back(HavingExprToSQL(*child, binding_to_alias));
 		}
-		const auto &name = function.function.name;
+		const auto &name = function.Function().GetName().GetIdentifierName();
 		if (children.size() == 2 && (name == "+" || name == "-" || name == "*" || name == "/" || name == "%")) {
 			return "(" + children[0] + " " + name + " " + children[1] + ")";
 		}
@@ -1956,20 +1965,15 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 		}
 		return result + ")";
 	}
-	case ExpressionClass::BOUND_CAST: {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		return string(cast.try_cast ? "TRY_CAST(" : "CAST(") + HavingExprToSQL(*cast.child, binding_to_alias) + " AS " +
-		       cast.return_type.ToString() + ")";
-	}
 	case ExpressionClass::BOUND_CONJUNCTION: {
 		auto &conj = expr.Cast<BoundConjunctionExpression>();
-		string op = (conj.type == ExpressionType::CONJUNCTION_AND) ? " AND " : " OR ";
+		string op = (expr.GetExpressionType() == ExpressionType::CONJUNCTION_AND) ? " AND " : " OR ";
 		string result;
-		for (idx_t i = 0; i < conj.children.size(); i++) {
+		for (idx_t i = 0; i < conj.GetChildren().size(); i++) {
 			if (i > 0) {
 				result += op;
 			}
-			result += "(" + HavingExprToSQL(*conj.children[i], binding_to_alias) + ")";
+			result += "(" + HavingExprToSQL(*conj.GetChildren()[i], binding_to_alias) + ")";
 		}
 		return result;
 	}
@@ -1978,26 +1982,27 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 		// aggregate references inside still get rewritten to their output alias.
 		auto &op = expr.Cast<BoundOperatorExpression>();
 		string suffix;
-		if (expr.type == ExpressionType::OPERATOR_IS_NULL) {
+		if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
 			suffix = " IS NULL";
-		} else if (expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
+		} else if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
 			suffix = " IS NOT NULL";
 		}
-		if (!suffix.empty() && op.children.size() == 1) {
-			return "(" + HavingExprToSQL(*op.children[0], binding_to_alias) + ")" + suffix;
+		if (!suffix.empty() && op.GetChildren().size() == 1) {
+			return "(" + HavingExprToSQL(*op.GetChildren()[0], binding_to_alias) + ")" + suffix;
 		}
-		if (expr.type == ExpressionType::OPERATOR_NOT && op.children.size() == 1) {
-			return "(NOT (" + HavingExprToSQL(*op.children[0], binding_to_alias) + "))";
+		if (expr.GetExpressionType() == ExpressionType::OPERATOR_NOT && op.GetChildren().size() == 1) {
+			return "(NOT (" + HavingExprToSQL(*op.GetChildren()[0], binding_to_alias) + "))";
 		}
-		if ((expr.type == ExpressionType::COMPARE_IN || expr.type == ExpressionType::COMPARE_NOT_IN) &&
-		    op.children.size() >= 2) {
-			string result = "(" + HavingExprToSQL(*op.children[0], binding_to_alias) +
-			                (expr.type == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (");
-			for (idx_t i = 1; i < op.children.size(); i++) {
+		if ((expr.GetExpressionType() == ExpressionType::COMPARE_IN ||
+		     expr.GetExpressionType() == ExpressionType::COMPARE_NOT_IN) &&
+		    op.GetChildren().size() >= 2) {
+			string result = "(" + HavingExprToSQL(*op.GetChildren()[0], binding_to_alias) +
+			                (expr.GetExpressionType() == ExpressionType::COMPARE_IN ? " IN (" : " NOT IN (");
+			for (idx_t i = 1; i < op.GetChildren().size(); i++) {
 				if (i > 1) {
 					result += ", ";
 				}
-				result += HavingExprToSQL(*op.children[i], binding_to_alias);
+				result += HavingExprToSQL(*op.GetChildren()[i], binding_to_alias);
 			}
 			return result + "))";
 		}
@@ -2009,10 +2014,10 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 		// printed form — but that references base columns the data table doesn't have.
 		// Best effort: check if any child is a plain BCR registered in the map.
 		auto &agg = expr.Cast<BoundAggregateExpression>();
-		if (agg.children.size() == 1 && agg.children[0]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
-			auto &col = agg.children[0]->Cast<BoundColumnRefExpression>();
-			uint64_t key =
-			    (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
+		if (agg.GetChildren().size() == 1 &&
+		    agg.GetChildren()[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			auto &col = agg.GetChildren()[0]->Cast<BoundColumnRefExpression>();
+			uint64_t key = DerivedOutputBindingKey(col.Binding());
 			auto it = binding_to_alias.find(key);
 			if (it != binding_to_alias.end()) {
 				return it->second;
@@ -2026,10 +2031,10 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
 }
 
 /// Collect every BOUND_COLUMN_REF binding referenced by the expression tree.
-static void CollectFilterBindings(Expression &expr, std::set<pair<idx_t, idx_t>> &out) {
-	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+static void CollectFilterBindings(Expression &expr, std::set<pair<TableIndex, ProjectionIndex>> &out) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &col = expr.Cast<BoundColumnRefExpression>();
-		out.insert({col.binding.table_index, col.binding.column_index});
+		out.insert({col.Binding().table_index, col.Binding().column_index});
 		return;
 	}
 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CollectFilterBindings(child, out); });
@@ -2115,9 +2120,9 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 			auto *output_projection = proj_chain.front();
 			for (idx_t i = 0; i < output_projection->expressions.size() && i < output_names.size(); i++) {
 				auto *resolved = ResolveDerivedOutputPassThrough(*output_projection->expressions[i], projections);
-				if (resolved && resolved->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+				if (resolved && resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 					auto &column = resolved->Cast<BoundColumnRefExpression>();
-					binding_to_alias[DerivedOutputBindingKey(column.binding)] = output_names[i];
+					binding_to_alias[DerivedOutputBindingKey(column.Binding())] = output_names[i];
 				}
 			}
 		}
@@ -2132,7 +2137,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 	if (proj_ptr && !filter_node->children.empty() &&
 	    filter_node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 		auto &agg_child = filter_node->children[0]->Cast<LogicalAggregate>();
-		std::set<pair<idx_t, idx_t>> filter_bindings;
+		std::set<pair<TableIndex, ProjectionIndex>> filter_bindings;
 		for (auto &expr : filter.expressions) {
 			CollectFilterBindings(*expr, filter_bindings);
 		}
@@ -2140,7 +2145,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 		bool added_hidden_having_column = false;
 		idx_t hidden_start_idx = proj_ptr->expressions.size();
 		for (auto &b : filter_bindings) {
-			uint64_t key = (uint64_t)b.first ^ ((uint64_t)b.second * 0x9e3779b97f4a7c15ULL);
+			uint64_t key = DerivedOutputBindingKey(ColumnBinding(b.first, b.second));
 			if (binding_to_alias.find(key) != binding_to_alias.end()) {
 				continue;
 			}
@@ -2153,10 +2158,11 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 				continue;
 			}
 			string hidden_name = "openivm_having_" + std::to_string(next_hidden++);
-			auto col_type = agg_child.expressions[b.second]->return_type;
+			auto col_type = agg_child.expressions[b.second]->GetReturnType();
 			auto hidden_expr =
-			    make_uniq<BoundColumnRefExpression>(hidden_name, col_type, ColumnBinding(b.first, b.second));
-			hidden_expr->alias = hidden_name;
+				    make_uniq<BoundColumnRefExpression>(Identifier(hidden_name), col_type,
+				                                       ColumnBinding(b.first, b.second));
+			hidden_expr->SetAlias(Identifier(hidden_name));
 			proj_ptr->expressions.push_back(std::move(hidden_expr));
 			output_names.push_back(hidden_name);
 			binding_to_alias[key] = hidden_name;
@@ -2182,17 +2188,18 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 				};
 				vector<CarriedColumn> carried;
 				for (idx_t i = hidden_start_idx; i < proj_ptr->expressions.size(); i++) {
-					carried.push_back({ColumnBinding(proj_ptr->table_index, i), proj_ptr->expressions[i]->return_type,
-					                   proj_ptr->expressions[i]->GetName()});
+					carried.push_back({ColumnBinding(proj_ptr->table_index, ProjectionIndex(i)),
+					                   proj_ptr->expressions[i]->GetReturnType(),
+					   proj_ptr->expressions[i]->GetName().GetIdentifierName()});
 				}
 				for (idx_t level = proj_chain.size() - 1; level-- > 0;) {
 					auto *upper = proj_chain[level];
 					vector<CarriedColumn> next_carried;
 					for (auto &c : carried) {
-						auto ref = make_uniq<BoundColumnRefExpression>(c.name, c.type, c.binding);
-						ref->alias = c.name;
+						auto ref = make_uniq<BoundColumnRefExpression>(Identifier(c.name), c.type, c.binding);
+						ref->SetAlias(Identifier(c.name));
 						next_carried.push_back(
-						    {ColumnBinding(upper->table_index, upper->expressions.size()), c.type, c.name});
+				    {ColumnBinding(upper->table_index, ProjectionIndex(upper->expressions.size())), c.type, c.name});
 						upper->expressions.push_back(std::move(ref));
 					}
 					upper->ResolveOperatorTypes();

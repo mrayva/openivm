@@ -99,9 +99,9 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 				auto alias = string(openivm::SORT_VALUE_PREFIX) + to_string(i);
 				auto &projection = *projections.back();
 				auto value = order.expression->Copy();
-				value->alias = alias;
-				auto type = value->return_type;
-				ColumnBinding binding(projection.table_index, projection.expressions.size());
+				value->SetAlias(Identifier(alias));
+				auto type = value->GetReturnType();
+				ColumnBinding binding(projection.table_index, ProjectionIndex(projection.expressions.size()));
 				projection.expressions.push_back(std::move(value));
 				projection.ResolveOperatorTypes();
 				vector<LogicalProjection *> ancestors(projections.begin(), projections.end() - 1);
@@ -129,7 +129,7 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
 }
 
 static bool IsDerivedAggregate(const BoundAggregateExpression &aggregate) {
-	const auto &name = aggregate.function.name;
+	const auto &name = aggregate.Function().GetName();
 	return name == "avg" || name == "stddev" || name == "stddev_samp" || name == "stddev_pop" || name == "variance" ||
 	       name == "var_samp" || name == "var_pop";
 }
@@ -143,11 +143,11 @@ static bool PrepareCtesForInlining(LogicalOperator *op, PlanRewriteNeeds &needs)
 		needs.has_aggregate = true;
 		auto &aggregate = op->Cast<LogicalAggregate>();
 		for (auto &expression : aggregate.expressions) {
-			if (expression->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			if (expression->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 				continue;
 			}
 			auto &bound_aggregate = expression->Cast<BoundAggregateExpression>();
-			needs.aggregate_filters = needs.aggregate_filters || bound_aggregate.filter;
+			needs.aggregate_filters = needs.aggregate_filters || static_cast<bool>(bound_aggregate.GetFilter());
 			needs.derived_aggregates = needs.derived_aggregates || IsDerivedAggregate(bound_aggregate);
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
@@ -234,15 +234,16 @@ string ExplainInitialLoadQuery(Connection &con, const string &label, const strin
 }
 
 void AddJoinKeyColumn(const unique_ptr<Expression> &expr, unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols) {
-	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return;
 	}
 	auto &bcr = expr->Cast<BoundColumnRefExpression>();
-	join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
+		join_key_cols[bcr.Binding().table_index.index].insert(bcr.Binding().column_index.GetIndexUnsafe());
 }
 
 static string BindingKey(const BoundColumnRefExpression &bcr) {
-	return to_string(bcr.binding.table_index) + ":" + to_string(bcr.binding.column_index);
+	return to_string(bcr.Binding().table_index.index) + ":" +
+	       to_string(bcr.Binding().column_index.GetIndexUnsafe());
 }
 
 static string FindBindingParent(unordered_map<string, string> &parents, const string &key) {
@@ -267,20 +268,20 @@ static void UnionBindings(unordered_map<string, string> &parents, const string &
 }
 
 static bool IsPurePassThroughExpression(const Expression *expr) {
-	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		return true;
 	}
-	if (expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
-		return IsPurePassThroughExpression(cast.child.get());
+	if (BoundCastExpression::IsCast(*expr)) {
+		auto &cast = expr->Cast<BoundFunctionExpression>();
+		return IsPurePassThroughExpression(&BoundCastExpression::Child(cast));
 	}
 	return false;
 }
 
 static bool ExpressionReferencesNonGroupBinding(Expression *expr, idx_t group_index) {
-	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
+	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		return bcr.binding.table_index != group_index;
+		return bcr.Binding().table_index.index != group_index;
 	}
 	bool refs_non_group = false;
 	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
@@ -295,11 +296,11 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t grou
 	for (auto *agg_ptr : facts.aggregates) {
 		auto &agg = *agg_ptr;
 		for (auto &expr : agg.expressions) {
-			if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 				continue;
 			}
 			auto &bound = expr->Cast<BoundAggregateExpression>();
-			for (auto &child : bound.children) {
+			for (auto &child : bound.GetChildren()) {
 				if (!IsPurePassThroughExpression(child.get())) {
 					return true;
 				}
@@ -350,15 +351,17 @@ bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts) {
 
 static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMVPlanFacts &facts,
                         unordered_map<string, idx_t> &next_occurrence) {
-	facts.gets_by_index[get.table_index] = &get;
+	facts.gets_by_index[get.table_index.index] = &get;
 	auto table_ref = get.GetTable();
 	if (table_ref.get()) {
 		auto &table = *table_ref.get();
-		string table_name = table.name;
+		string table_name = table.name.GetIdentifierName();
 		if (!table_name.empty() && !SqlUtils::IsDelta(table_name)) {
-			auto key = SqlUtils::FullName(table.ParentCatalog().GetName(), table.schema.name, table_name);
+			auto catalog_name = table.ParentCatalog().GetName().GetIdentifierName();
+			auto schema_name = table.schema.name.GetIdentifierName();
+			auto key = SqlUtils::FullName(catalog_name, schema_name, table_name);
 			if (facts.source_table_info
-			        .emplace(key, SourceTableInfo {table_name, table.ParentCatalog().GetName(), table.schema.name})
+			        .emplace(key, SourceTableInfo {table_name, catalog_name, schema_name})
 			        .second) {
 				facts.source_name_counts[table_name]++;
 			}
@@ -367,15 +370,15 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 		ProjectionSourceOccurrence source;
 		source.table = table_name;
 		source.occurrence = next_occurrence[table_lc]++;
-		source.table_index = get.table_index;
-		facts.occurrence_by_index[get.table_index] = source;
+		source.table_index = get.table_index.index;
+		facts.occurrence_by_index[get.table_index.index] = source;
 		facts.source_occurrences.push_back(std::move(source));
 	}
 	if (get.function.name != "ducklake_scan" || !get.function.function_info) {
 		return;
 	}
 	auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
-	string cat = info.table.ParentCatalog().GetName();
+	string cat = info.table.ParentCatalog().GetName().GetIdentifierName();
 	if (cat.empty()) {
 		if (current_catalog.empty()) {
 			throw CatalogException("Could not resolve DuckLake catalog for table '" + info.table_name + "'");
@@ -385,9 +388,9 @@ static void AddGetFacts(LogicalGet &get, const string &current_catalog, CreateMV
 	DuckLakeSourceTableInfo source_info;
 	source_info.table_name = info.table_name;
 	source_info.catalog_name = cat;
-	source_info.schema_name = info.table.schema.name;
+	source_info.schema_name = info.table.schema.name.GetIdentifierName();
 	source_info.table_id = static_cast<int64_t>(info.table_id.index);
-	facts.ducklake_table_info[SqlUtils::FullName(cat, info.table.schema.name, info.table_name)] = source_info;
+	facts.ducklake_table_info[SqlUtils::FullName(cat, source_info.schema_name, info.table_name)] = source_info;
 }
 
 static string NullableGetTableName(LogicalGet &get);
@@ -410,7 +413,7 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		return "";
 	}
 	for (auto &binding : op->GetColumnBindings()) {
-		facts.max_table_index = std::max(facts.max_table_index, binding.table_index);
+		facts.max_table_index = std::max(facts.max_table_index, binding.table_index.index);
 	}
 	AnalyzePlanOperator(*op, analysis);
 	auto *logical_join = dynamic_cast<LogicalJoin *>(op);
@@ -432,7 +435,7 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 			facts.has_union_before_aggregate = true;
 		}
 		auto &setop = op->Cast<LogicalSetOperation>();
-		facts.setops_by_index[setop.table_index] = &setop;
+		facts.setops_by_index[setop.table_index.index] = &setop;
 	} else if (op->type == LogicalOperatorType::LOGICAL_INTERSECT || op->type == LogicalOperatorType::LOGICAL_EXCEPT) {
 		facts.has_unsupported_set_operation = true;
 	} else if (op->type == LogicalOperatorType::LOGICAL_PIVOT) {
@@ -462,7 +465,7 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 			facts.first_projection = &proj;
 		}
 		facts.projections.push_back(&proj);
-		facts.projections_by_index[proj.table_index] = &proj;
+		facts.projections_by_index[proj.table_index.index] = &proj;
 	} else if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN ||
 	           op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN ||
 	           op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
@@ -471,9 +474,9 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 			facts.comparison_joins.push_back(&join);
 			for (auto &cond : join.conditions) {
-				auto *left = cond.left.get();
-				auto *right = cond.right.get();
-				if (left->type != ExpressionType::BOUND_COLUMN_REF || right->type != ExpressionType::BOUND_COLUMN_REF) {
+				auto *left = cond.LeftReference().get();
+				auto *right = cond.RightReference().get();
+				if (left->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF || right->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 					continue;
 				}
 				auto &left_ref = left->Cast<BoundColumnRefExpression>();
@@ -485,39 +488,39 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		}
 		if (op->type == LogicalOperatorType::LOGICAL_DELIM_JOIN && join.join_type == JoinType::SINGLE) {
 			for (auto &expr : join.duplicate_eliminated_columns) {
-				if (expr && expr->type == ExpressionType::BOUND_COLUMN_REF) {
+				if (expr && expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 					facts.single_delim_key_bindings.insert(BindingKey(expr->Cast<BoundColumnRefExpression>()));
 				}
 			}
 			for (auto &cond : join.conditions) {
-				if (cond.left && cond.left->type == ExpressionType::BOUND_COLUMN_REF) {
-					facts.single_delim_key_bindings.insert(BindingKey(cond.left->Cast<BoundColumnRefExpression>()));
+				if (cond.LeftReference() && cond.LeftReference()->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+					facts.single_delim_key_bindings.insert(BindingKey(cond.LeftReference()->Cast<BoundColumnRefExpression>()));
 				}
-				if (cond.right && cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
-					facts.single_delim_key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
+				if (cond.RightReference() && cond.RightReference()->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+					facts.single_delim_key_bindings.insert(BindingKey(cond.RightReference()->Cast<BoundColumnRefExpression>()));
 				}
 			}
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
 		facts.has_cardinality_changing_filter =
-		    facts.has_cardinality_changing_filter || !get.table_filters.filters.empty();
+		    facts.has_cardinality_changing_filter || get.table_filters.HasFilters();
 		AddGetFacts(get, current_catalog, facts, next_occurrence);
 		auto table_ref = get.GetTable();
 		if (table_ref.get()) {
-			first_table = table_ref.get()->name;
+			first_table = table_ref.get()->name.GetIdentifierName();
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &cte_ref = op->Cast<LogicalCTERef>();
-		facts.cte_refs_by_table_index[cte_ref.table_index] = &cte_ref;
+		facts.cte_refs_by_table_index[cte_ref.table_index.index] = &cte_ref;
 		if (under_join) {
-			if (++facts.cte_refs_under_join_count[cte_ref.cte_index] >= 2) {
+			if (++facts.cte_refs_under_join_count[cte_ref.cte_index.index] >= 2) {
 				facts.has_repeated_cte_ref_under_join = true;
 			}
 		}
 	} else if (op->type == LogicalOperatorType::LOGICAL_MATERIALIZED_CTE && op->children.size() >= 2) {
 		auto &cte = op->Cast<LogicalMaterializedCTE>();
-		facts.cte_defs_by_index[cte.table_index] = op->children[0].get();
+		facts.cte_defs_by_index[cte.table_index.index] = op->children[0].get();
 	} else if (op->type == LogicalOperatorType::LOGICAL_WINDOW) {
 		facts.windows.push_back(&op->Cast<LogicalWindow>());
 	}
@@ -580,7 +583,7 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	}
 	if (op->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = op->Cast<LogicalGet>();
-		node_facts.subtree_table_indices.push_back(get.table_index);
+		node_facts.subtree_table_indices.push_back(get.table_index.index);
 		string table_name = NullableGetTableName(get);
 		if (table_name.empty()) {
 			node_facts.subtree_base_tables_complete = false;
@@ -602,25 +605,25 @@ static bool IsHiddenHavingColumn(const string &name) {
 
 static bool IsMinMaxAggregateColumn(const BoundColumnRefExpression &column_ref,
                                     const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	auto aggregate_it = aggregates.find(column_ref.binding.table_index);
+	auto aggregate_it = aggregates.find(column_ref.Binding().table_index.index);
 	if (aggregate_it == aggregates.end()) {
 		return false;
 	}
 	auto &aggregate = *aggregate_it->second;
-	if (column_ref.binding.column_index >= aggregate.expressions.size()) {
+	if (column_ref.Binding().column_index.GetIndexUnsafe() >= aggregate.expressions.size()) {
 		return false;
 	}
-	auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-	if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+	auto &aggregate_expr = aggregate.expressions[column_ref.Binding().column_index.GetIndexUnsafe()];
+	if (aggregate_expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 		return false;
 	}
 	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-	return bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max";
+	return bound_aggregate.Function().GetName() == "min" || bound_aggregate.Function().GetName() == "max";
 }
 
 static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
                                                 const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
 		return IsMinMaxAggregateColumn(column_ref, aggregates);
 	}
@@ -640,31 +643,31 @@ static bool ExpressionReferencesUserSumAggregate(Expression &expr, const CreateM
 	if (depth > 16) {
 		return false;
 	}
-	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
+	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
-		auto aggregate_it = aggregates.find(column_ref.binding.table_index);
+		auto aggregate_it = aggregates.find(column_ref.Binding().table_index.index);
 		if (aggregate_it != aggregates.end()) {
 			auto &aggregate = *aggregate_it->second;
-			if (column_ref.binding.column_index >= aggregate.expressions.size()) {
+			if (column_ref.Binding().column_index.GetIndexUnsafe() >= aggregate.expressions.size()) {
 				return false;
 			}
-			auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-			if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			auto &aggregate_expr = aggregate.expressions[column_ref.Binding().column_index.GetIndexUnsafe()];
+			if (aggregate_expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 				return false;
 			}
 			auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-			return bound_aggregate.function.name == "sum" &&
-			       !IncrementalTableNames::IsInternalColumn(bound_aggregate.alias);
+			return bound_aggregate.Function().GetName() == "sum" &&
+			       !IncrementalTableNames::IsInternalColumn(bound_aggregate.GetAlias().GetIdentifierName());
 		}
-		auto projection_it = facts.projections_by_index.find(column_ref.binding.table_index);
+		auto projection_it = facts.projections_by_index.find(column_ref.Binding().table_index.index);
 		if (projection_it == facts.projections_by_index.end()) {
 			return false;
 		}
 		auto &projection = *projection_it->second;
-		if (column_ref.binding.column_index >= projection.expressions.size()) {
+		if (column_ref.Binding().column_index.GetIndexUnsafe() >= projection.expressions.size()) {
 			return false;
 		}
-		return ExpressionReferencesUserSumAggregate(*projection.expressions[column_ref.binding.column_index], facts,
+		return ExpressionReferencesUserSumAggregate(*projection.expressions[column_ref.Binding().column_index.GetIndexUnsafe()], facts,
 		                                            aggregates, depth + 1);
 	}
 
@@ -680,7 +683,7 @@ static bool ExpressionReferencesUserSumAggregate(Expression &expr, const CreateM
 static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 	unordered_map<idx_t, LogicalAggregate *> aggregates;
 	for (auto *aggregate : facts.aggregates) {
-		aggregates[aggregate->aggregate_index] = aggregate;
+		aggregates[aggregate->aggregate_index.index] = aggregate;
 	}
 	if (aggregates.empty()) {
 		return;
@@ -688,19 +691,20 @@ static void FinalizeCreateMVPlanFacts(CreateMVPlanFacts &facts) {
 	for (auto *projection : facts.projections) {
 		for (auto &expr : projection->expressions) {
 			Expression *unwrapped = expr.get();
-			while (unwrapped->expression_class == ExpressionClass::BOUND_CAST) {
-				unwrapped = unwrapped->Cast<BoundCastExpression>().child.get();
+			while (BoundCastExpression::IsCast(*unwrapped)) {
+				unwrapped = BoundCastExpression::ChildMutable(unwrapped->Cast<BoundFunctionExpression>()).get();
 			}
-			if (unwrapped->expression_class != ExpressionClass::BOUND_COLUMN_REF &&
+			if (unwrapped->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
 			    ExpressionReferencesUserSumAggregate(*unwrapped, facts, aggregates)) {
 				facts.has_computed_sum_aggregate_projection = true;
 			}
-			if (expr->expression_class == ExpressionClass::BOUND_COLUMN_REF && IsHiddenHavingColumn(expr->alias)) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF &&
+			    IsHiddenHavingColumn(expr->GetAlias().GetIdentifierName())) {
 				auto &column_ref = expr->Cast<BoundColumnRefExpression>();
 				if (IsMinMaxAggregateColumn(column_ref, aggregates)) {
 					facts.has_hidden_minmax_having_column = true;
 				}
-			} else if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF &&
+			} else if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF &&
 			           ExpressionReferencesMinMaxAggregate(*expr, aggregates)) {
 				facts.has_computed_minmax_aggregate_projection = true;
 			}
@@ -723,14 +727,14 @@ bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_
 			return false;
 		}
 		auto *expr = proj.expressions[column_index].get();
-		while (through_casts && expr->expression_class == ExpressionClass::BOUND_CAST) {
-			expr = expr->Cast<BoundCastExpression>().child.get();
+		while (through_casts && BoundCastExpression::IsCast(*expr)) {
+			expr = BoundCastExpression::ChildMutable(expr->Cast<BoundFunctionExpression>()).get();
 		}
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		return ResolvesToOutputBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+		return ResolvesToOutputBinding(bcr.Binding().table_index.index, bcr.Binding().column_index.GetIndexUnsafe(), group_index, group_count,
 		                               facts, through_casts, depth + 1);
 	}
 	auto setop_it = facts.setops_by_index.find(table_index);
@@ -745,7 +749,7 @@ bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_
 				continue;
 			}
 			auto &binding = bindings[column_index];
-			if (ResolvesToOutputBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
+			if (ResolvesToOutputBinding(binding.table_index.index, binding.column_index.GetIndexUnsafe(), group_index, group_count, facts,
 			                            through_casts, depth + 1)) {
 				return true;
 			}
@@ -755,7 +759,7 @@ bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_
 	auto cte_ref_it = facts.cte_refs_by_table_index.find(table_index);
 	if (cte_ref_it != facts.cte_refs_by_table_index.end()) {
 		auto &cte_ref = *cte_ref_it->second;
-		auto cte_def_it = facts.cte_defs_by_index.find(cte_ref.cte_index);
+		auto cte_def_it = facts.cte_defs_by_index.find(cte_ref.cte_index.index);
 		if (cte_def_it == facts.cte_defs_by_index.end()) {
 			return false;
 		}
@@ -764,7 +768,7 @@ bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_
 			return false;
 		}
 		auto &binding = bindings[column_index];
-		return ResolvesToOutputBinding(binding.table_index, binding.column_index, group_index, group_count, facts,
+		return ResolvesToOutputBinding(binding.table_index.index, binding.column_index.GetIndexUnsafe(), group_index, group_count, facts,
 		                               through_casts, depth + 1);
 	}
 	return false;
@@ -777,14 +781,14 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t 
 
 static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
                                    const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
-	if (!expr->alias.empty()) {
-		return expr->alias;
+	if (!expr->GetAlias().empty()) {
+		return expr->GetAlias().GetIdentifierName();
 	}
 	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
 	    !IncrementalTableNames::IsInternalColumn(output_names[expr_index])) {
 		return output_names[expr_index];
 	}
-	return bcr.GetName();
+	return bcr.GetName().GetIdentifierName();
 }
 
 static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr) {
@@ -792,14 +796,15 @@ static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, stri
 		cast_type->clear();
 	}
 	vector<string> cast_specs;
-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr->Cast<BoundCastExpression>();
+	while (expr && BoundCastExpression::IsCast(*expr)) {
+		auto &cast = expr->Cast<BoundFunctionExpression>();
 		if (cast_type) {
-			cast_specs.push_back(SqlUtils::BuildCastSpec(expr->return_type.ToString(), cast.try_cast));
+			cast_specs.push_back(
+			    SqlUtils::BuildCastSpec(expr->GetReturnType().ToString(), BoundCastExpression::IsTryCast(cast)));
 		}
-		expr = cast.child.get();
+		expr = BoundCastExpression::ChildMutable(cast).get();
 	}
-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+	if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return nullptr;
 	}
 	if (cast_type) {
@@ -816,11 +821,11 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj, const CreateM
 	bool matched = false;
 	for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
 		auto &expr = proj.expressions[expr_i];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			continue;
 		}
 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
-		if (!ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
+		if (!ResolvesToGroupBinding(bcr.Binding().table_index.index, bcr.Binding().column_index.GetIndexUnsafe(), group_index, group_count,
 		                            facts)) {
 			continue;
 		}
@@ -841,7 +846,7 @@ static bool AddGroupColumnsFromBindings(LogicalOperator &op, const CreateMVPlanF
 	auto bindings = op.GetColumnBindings();
 	for (idx_t col_idx = 0; col_idx < bindings.size() && col_idx < output_names.size(); col_idx++) {
 		auto &binding = bindings[col_idx];
-		if (!ResolvesToGroupBinding(binding.table_index, binding.column_index, group_index, group_count, facts)) {
+		if (!ResolvesToGroupBinding(binding.table_index.index, binding.column_index.GetIndexUnsafe(), group_index, group_count, facts)) {
 			continue;
 		}
 		if (!output_names[col_idx].empty() && (!IncrementalTableNames::IsInternalColumn(output_names[col_idx]) ||
@@ -881,7 +886,7 @@ static bool IsGroupExpression(const Expression &expression, const CreateMVPlanFa
                               size_t group_count) {
 	if (expression.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column = expression.Cast<BoundColumnRefExpression>();
-		return ResolvesToGroupBinding(column.binding.table_index, column.binding.column_index, group_index, group_count,
+		return ResolvesToGroupBinding(column.Binding().table_index.index, column.Binding().column_index.GetIndexUnsafe(), group_index, group_count,
 		                              facts);
 	}
 	bool valid = expression.GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE;
@@ -938,7 +943,7 @@ vector<string> DeriveScalarDelimKeyColumnNames(const CreateMVPlanFacts &facts, c
 		for (idx_t expr_idx = 0; expr_idx < top_projection->expressions.size() && expr_idx < output_names.size();
 		     expr_idx++) {
 			auto &expr = top_projection->expressions[expr_idx];
-			if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+			if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				continue;
 			}
 			if (!facts.single_delim_key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
@@ -968,7 +973,7 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 		seen_aggregate = true;
 		if (include_this && !agg.groups.empty()) {
 			vector<string> nested_names;
-			if (FindGroupColumns(facts, agg.group_index, agg.groups.size(), output_names, nested_names)) {
+			if (FindGroupColumns(facts, agg.group_index.index, agg.groups.size(), output_names, nested_names)) {
 				AddUniqueGroupNames(group_names, nested_names);
 			}
 		}
@@ -979,8 +984,8 @@ vector<string> DeriveAggregateGroupColumnNames(const CreateMVPlanFacts &facts, c
 static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string &column);
 
 static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const CreateMVPlanFacts &facts) {
-	idx_t table_index = bcr->binding.table_index;
-	idx_t column_index = bcr->binding.column_index;
+	idx_t table_index = bcr->Binding().table_index.index;
+	idx_t column_index = bcr->Binding().column_index.GetIndexUnsafe();
 	for (int depth = 0; depth < 16; depth++) {
 		auto get_it = facts.gets_by_index.find(table_index);
 		if (get_it != facts.gets_by_index.end()) {
@@ -997,12 +1002,12 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr, const Cr
 			return "";
 		}
 		auto &expr = proj->expressions[column_index];
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
-			return expr->alias.empty() ? expr->GetName() : expr->alias;
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+			return expr->HasAlias() ? expr->GetAlias().GetIdentifierName() : expr->GetName().GetIdentifierName();
 		}
 		auto &next = expr->Cast<BoundColumnRefExpression>();
-		table_index = next.binding.table_index;
-		column_index = next.binding.column_index;
+		table_index = next.Binding().table_index.index;
+		column_index = next.Binding().column_index.GetIndexUnsafe();
 	}
 	return "";
 }
@@ -1025,13 +1030,13 @@ static bool GetLogicalGetColumnName(LogicalGet &get, idx_t column_index, string 
 			auto base_idx = ids[column_index].GetPrimaryIndex();
 			auto &cols = get.GetTable().get()->GetColumns();
 			if (base_idx < cols.LogicalColumnCount()) {
-				column = cols.GetColumn(LogicalIndex(base_idx)).Name();
+				column = cols.GetColumn(LogicalIndex(base_idx)).Name().GetIdentifierName();
 				return true;
 			}
 		}
 	}
 	if (column_index < get.names.size()) {
-		column = get.names[column_index];
+		column = get.names[column_index].GetIdentifierName();
 		return true;
 	}
 	return false;
@@ -1062,8 +1067,8 @@ static bool HasKeyBinding(const vector<ColumnBinding> &keys, const ColumnBinding
 
 static bool IsKeyReference(const Expression &expr, const vector<ColumnBinding> &keys) {
 	// Casts and computed expressions need a separate equivalence proof.
-	return expr.type == ExpressionType::BOUND_COLUMN_REF &&
-	       HasKeyBinding(keys, expr.Cast<BoundColumnRefExpression>().binding);
+	return expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF &&
+	       HasKeyBinding(keys, expr.Cast<BoundColumnRefExpression>().Binding());
 }
 
 static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const CreateMVPlanFacts &facts,
@@ -1082,7 +1087,8 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 		source = table;
 		for (idx_t i = 0; i < bindings.size(); i++) {
 			string column;
-			if (GetLogicalGetColumnName(get, bindings[i].column_index, column) && StringUtil::CIEquals(column, key)) {
+			if (GetLogicalGetColumnName(get, bindings[i].column_index.GetIndexUnsafe(), column) &&
+			    StringUtil::CIEquals(column, key)) {
 				result.push_back(bindings[i]);
 			}
 		}
@@ -1090,7 +1096,7 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = op.Cast<LogicalCTERef>();
-		auto def = facts.cte_defs_by_index.find(ref.cte_index);
+		auto def = facts.cte_defs_by_index.find(ref.cte_index.index);
 		if (def == facts.cte_defs_by_index.end()) {
 			return {};
 		}
@@ -1121,9 +1127,9 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 		auto right = DirectSourceKeyBindings(*op.children[1], facts, key, source, depth + 1);
 		bool same_key = false;
 		for (auto &condition : join.conditions) {
-			if ((condition.comparison == ExpressionType::COMPARE_EQUAL ||
-			     condition.comparison == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
-			    IsKeyReference(*condition.left, left) && IsKeyReference(*condition.right, right)) {
+			if ((condition.GetComparisonType() == ExpressionType::COMPARE_EQUAL ||
+			     condition.GetComparisonType() == ExpressionType::COMPARE_NOT_DISTINCT_FROM) &&
+			    IsKeyReference(condition.GetLHS(), left) && IsKeyReference(condition.GetRHS(), right)) {
 				same_key = true;
 			}
 		}
@@ -1147,7 +1153,7 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 		auto &projection = op.Cast<LogicalProjection>();
 		for (idx_t i = 0; i < projection.expressions.size(); i++) {
 			if (IsKeyReference(*projection.expressions[i], left)) {
-				result.emplace_back(projection.table_index, i);
+				result.emplace_back(projection.table_index, ProjectionIndex(i));
 			}
 		}
 	} else if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
@@ -1157,8 +1163,8 @@ static vector<ColumnBinding> DirectSourceKeyBindings(LogicalOperator &op, const 
 		}
 		for (idx_t i = 0; i < aggregate.groups.size(); i++) {
 			if (IsKeyReference(*aggregate.groups[i], left) &&
-			    (aggregate.grouping_sets.empty() || aggregate.grouping_sets[0].count(i))) {
-				result.emplace_back(aggregate.group_index, i);
+			    (aggregate.grouping_sets.empty() || aggregate.grouping_sets[0].count(ProjectionIndex(i)))) {
+				result.emplace_back(aggregate.group_index, ProjectionIndex(i));
 			}
 		}
 	}
@@ -1194,8 +1200,8 @@ string DeriveDirectSourceGroupKey(const CreateMVPlanFacts &facts, const vector<s
 
 static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanFacts &facts, LogicalGet *&get,
                                       string &column) {
-	idx_t table_index = binding.table_index;
-	idx_t column_index = binding.column_index;
+	idx_t table_index = binding.table_index.index;
+	idx_t column_index = binding.column_index.GetIndexUnsafe();
 	for (int depth = 0; depth < 16; depth++) {
 		auto get_it = facts.gets_by_index.find(table_index);
 		if (get_it != facts.gets_by_index.end()) {
@@ -1214,8 +1220,8 @@ static bool ResolveBindingToGetColumn(ColumnBinding binding, const CreateMVPlanF
 		if (!next) {
 			return false;
 		}
-		table_index = next->binding.table_index;
-		column_index = next->binding.column_index;
+		table_index = next->Binding().table_index.index;
+		column_index = next->Binding().column_index.GetIndexUnsafe();
 	}
 	return false;
 }
@@ -1225,7 +1231,7 @@ static bool ResolveBindingToBaseRef(ColumnBinding binding, const CreateMVPlanFac
 	if (!ResolveBindingToGetColumn(binding, facts, get, out.column) || !get->GetTable().get()) {
 		return false;
 	}
-	out.table = facts.occurrence_by_index.at(get->table_index).table;
+	out.table = facts.occurrence_by_index.at(get->table_index.index).table;
 	return true;
 }
 
@@ -1235,7 +1241,7 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVP
 	if (!ResolveBindingToGetColumn(binding, facts, get, out.column)) {
 		return false;
 	}
-	auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
+	 auto occurrence_it = facts.occurrence_by_index.find(get->table_index.index);
 	if (occurrence_it == facts.occurrence_by_index.end()) {
 		return false;
 	}
@@ -1247,8 +1253,8 @@ static bool ResolveBindingToOccurrenceRef(ColumnBinding binding, const CreateMVP
 static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const CreateMVPlanFacts &facts,
                                                   OccurrenceColumnRef &out, string &cast_type,
                                                   const LogicalType &expression_type) {
-	idx_t table_index = binding.table_index;
-	idx_t column_index = binding.column_index;
+	idx_t table_index = binding.table_index.index;
+	idx_t column_index = binding.column_index.GetIndexUnsafe();
 	for (int depth = 0; depth < 16; depth++) {
 		auto get_it = facts.gets_by_index.find(table_index);
 		if (get_it != facts.gets_by_index.end()) {
@@ -1256,7 +1262,7 @@ static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const C
 			if (!GetLogicalGetColumnName(*get, column_index, out.column)) {
 				return false;
 			}
-			auto occurrence_it = facts.occurrence_by_index.find(get->table_index);
+			auto occurrence_it = facts.occurrence_by_index.find(get->table_index.index);
 			if (occurrence_it == facts.occurrence_by_index.end()) {
 				return false;
 			}
@@ -1285,8 +1291,8 @@ static bool ResolveBindingToOccurrenceRefWithCast(ColumnBinding binding, const C
 		if (!projection_cast.empty()) {
 			cast_type = SqlUtils::ComposeCastSpecs(cast_type, projection_cast);
 		}
-		table_index = next->binding.table_index;
-		column_index = next->binding.column_index;
+		table_index = next->Binding().table_index.index;
+		column_index = next->Binding().column_index.GetIndexUnsafe();
 	}
 	return false;
 }
@@ -1297,22 +1303,22 @@ static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
 			continue;
 		}
 		for (auto &cond : join->conditions) {
-			auto *left = GetColumnRefThroughCasts(cond.left.get());
-			auto *right = GetColumnRefThroughCasts(cond.right.get());
+			auto *left = GetColumnRefThroughCasts(cond.LeftReference().get());
+			auto *right = GetColumnRefThroughCasts(cond.RightReference().get());
 			if (!left || !right) {
 				continue;
 			}
 			BaseColumnRef lbase, rbase;
-			if (ResolveBindingToBaseRef(left->binding, facts, lbase) &&
-			    ResolveBindingToBaseRef(right->binding, facts, rbase)) {
+			if (ResolveBindingToBaseRef(left->Binding(), facts, lbase) &&
+			    ResolveBindingToBaseRef(right->Binding(), facts, rbase)) {
 				facts.inner_join_edges.emplace_back(std::move(lbase), std::move(rbase));
 			}
-			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+			if (cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 				continue;
 			}
 			OccurrenceColumnRef lref, rref;
-			if (ResolveBindingToOccurrenceRef(left->binding, facts, lref) &&
-			    ResolveBindingToOccurrenceRef(right->binding, facts, rref)) {
+			if (ResolveBindingToOccurrenceRef(left->Binding(), facts, lref) &&
+			    ResolveBindingToOccurrenceRef(right->Binding(), facts, rref)) {
 				facts.projection_lineage_edges.push_back({lref, rref});
 				facts.projection_lineage_edges.push_back({rref, lref});
 			}
@@ -1340,23 +1346,23 @@ static bool ResolveBindingToGroupKey(const ColumnBinding &binding,
 	if (depth > 16) {
 		return false;
 	}
-	if (binding.table_index == aggregate.group_index) {
-		if (binding.column_index >= aggregate.groups.size()) {
+	if (binding.table_index.index == aggregate.group_index.index) {
+		if (binding.column_index.GetIndexUnsafe() >= aggregate.groups.size()) {
 			return false;
 		}
-		group_index = binding.column_index;
+		group_index = binding.column_index.GetIndexUnsafe();
 		return true;
 	}
-	auto projection = projections.find(binding.table_index);
-	if (projection == projections.end() || binding.column_index >= projection->second->expressions.size()) {
+	auto projection = projections.find(binding.table_index.index);
+	if (projection == projections.end() || binding.column_index.GetIndexUnsafe() >= projection->second->expressions.size()) {
 		return false;
 	}
-	auto &expression = projection->second->expressions[binding.column_index];
-	if (expression->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+	auto &expression = projection->second->expressions[binding.column_index.GetIndexUnsafe()];
+	if (expression->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &column = expression->Cast<BoundColumnRefExpression>();
-	return ResolveBindingToGroupKey(column.binding, projections, aggregate, group_index, depth + 1);
+	return ResolveBindingToGroupKey(column.Binding(), projections, aggregate, group_index, depth + 1);
 }
 
 bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node) {
@@ -1376,7 +1382,7 @@ bool IsRedundantDistinctOverGroupKeys(LogicalOperator &node) {
 	        current->type == LogicalOperatorType::LOGICAL_FILTER)) {
 		if (current->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			auto &projection = current->Cast<LogicalProjection>();
-			projections[projection.table_index] = &projection;
+			projections[projection.table_index.index] = &projection;
 		}
 		current = current->children[0].get();
 	}
@@ -1429,7 +1435,8 @@ CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &cu
 			continue;
 		}
 		auto table = facts.gets_by_index.at(source.table_index)->GetTable();
-		source.table = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+		source.table = SqlUtils::FullName(table->ParentCatalog().GetName().GetIdentifierName(),
+		                                  table->schema.name.GetIdentifierName(), table->name.GetIdentifierName());
 		source.occurrence = next_occurrence[source.table]++;
 		facts.occurrence_by_index[source.table_index] = source;
 	}
@@ -1541,7 +1548,7 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 			continue;
 		}
 		OccurrenceColumnRef key_ref;
-		if (!ResolveBindingToOccurrenceRef(bcr->binding, facts, key_ref)) {
+		if (!ResolveBindingToOccurrenceRef(bcr->Binding(), facts, key_ref)) {
 			continue;
 		}
 		string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
@@ -1585,19 +1592,19 @@ bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::Lef
 		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
 			continue;
 		}
-		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].left.get());
+		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].LeftReference().get());
 		if (!preserved_key) {
 			return false;
 		}
 		OccurrenceColumnRef source;
-		if (!ResolveBindingToOccurrenceRef(preserved_key->binding, facts, source)) {
+		if (!ResolveBindingToOccurrenceRef(preserved_key->Binding(), facts, source)) {
 			return false;
 		}
 		out.table = source.table;
 		out.occurrence = source.occurrence;
 		out.column = source.column;
 		out.cardinality_transition_check_safe = facts.outer_join_count == 1 && join->conditions.size() == 1 &&
-		                                        join->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
+		                                        join->conditions[0].GetComparisonType() == ExpressionType::COMPARE_EQUAL;
 		return true;
 	}
 	return false;
@@ -1606,7 +1613,7 @@ bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::Lef
 static string NullableGetTableName(LogicalGet &get) {
 	auto table = get.GetTable();
 	if (table.get() && !table.get()->name.empty()) {
-		return table.get()->name;
+		return table.get()->name.GetIdentifierName();
 	}
 	if (get.function.name == "ducklake_scan" && get.function.function_info) {
 		return get.function.function_info->Cast<DuckLakeFunctionInfo>().table_name;
@@ -1698,7 +1705,7 @@ static void CollectLeafColumnBindings(Expression *expr, vector<ColumnBinding> &b
 		return;
 	}
 	if (auto *bcr = GetColumnRefThroughCasts(expr)) {
-		bindings.push_back(bcr->binding);
+		bindings.push_back(bcr->Binding());
 		return;
 	}
 	ExpressionIterator::EnumerateChildren(*expr,
@@ -1725,19 +1732,19 @@ static bool ResolveBindingToOccurrenceRefsInternal(ColumnBinding binding, const 
 		AddUniqueOccurrenceRef(out, direct_ref);
 		return true;
 	}
-	auto proj_it = facts.projections_by_index.find(binding.table_index);
+	auto proj_it = facts.projections_by_index.find(binding.table_index.index);
 	if (proj_it == facts.projections_by_index.end()) {
 		return false;
 	}
 	auto *proj = proj_it->second;
-	if (binding.column_index >= proj->expressions.size()) {
+	if (binding.column_index.GetIndexUnsafe() >= proj->expressions.size()) {
 		return false;
 	}
 	vector<ColumnBinding> child_bindings;
-	CollectLeafColumnBindings(proj->expressions[binding.column_index].get(), child_bindings);
+	CollectLeafColumnBindings(proj->expressions[binding.column_index.GetIndexUnsafe()].get(), child_bindings);
 	bool found = false;
 	for (auto &child_binding : child_bindings) {
-		if (child_binding.table_index == binding.table_index && child_binding.column_index == binding.column_index) {
+		if (child_binding.table_index.index == binding.table_index.index && child_binding.column_index.GetIndexUnsafe() == binding.column_index.GetIndexUnsafe()) {
 			continue;
 		}
 		found |= ResolveBindingToOccurrenceRefsInternal(child_binding, facts, out, depth + 1);
@@ -1764,19 +1771,19 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
 	};
 	for (auto &condition : join.conditions) {
-		if (condition.comparison != ExpressionType::COMPARE_EQUAL) {
+		if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 			continue;
 		}
 		string left_cast;
 		string right_cast;
-		auto *left = GetColumnRefThroughCasts(condition.left.get(), &left_cast);
-		auto *right = GetColumnRefThroughCasts(condition.right.get(), &right_cast);
+		auto *left = GetColumnRefThroughCasts(condition.LeftReference().get(), &left_cast);
+		auto *right = GetColumnRefThroughCasts(condition.RightReference().get(), &right_cast);
 		if (!left || !right) {
 			continue;
 		}
 		OccurrenceColumnRef left_ref, right_ref;
-		if (!ResolveBindingToOccurrenceRefWithCast(left->binding, facts, left_ref, left_cast, left->return_type) ||
-		    !ResolveBindingToOccurrenceRefWithCast(right->binding, facts, right_ref, right_cast, right->return_type)) {
+		if (!ResolveBindingToOccurrenceRefWithCast(left->Binding(), facts, left_ref, left_cast, left->GetReturnType()) ||
+		    !ResolveBindingToOccurrenceRefWithCast(right->Binding(), facts, right_ref, right_cast, right->GetReturnType())) {
 			continue;
 		}
 		switch (join.join_type) {
@@ -1802,18 +1809,18 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlanFacts &facts,
                                        const vector<string> &partition_columns, vector<WindowLineageOp> &direct_ops) {
 	for (auto &expression : window.expressions) {
-		if (expression->expression_class != ExpressionClass::BOUND_WINDOW) {
+		if (expression->GetExpressionClass() != ExpressionClass::BOUND_WINDOW) {
 			continue;
 		}
 		auto &window_expression = expression->Cast<BoundWindowExpression>();
-		for (auto &partition : window_expression.partitions) {
+		for (auto &partition : window_expression.Partitions()) {
 			string partition_cast;
 			auto *column_ref = GetColumnRefThroughCasts(partition.get(), &partition_cast);
 			if (!column_ref) {
 				continue;
 			}
 			vector<OccurrenceColumnRef> refs;
-			if (!ResolveBindingToOccurrenceRefs(column_ref->binding, facts, refs)) {
+			if (!ResolveBindingToOccurrenceRefs(column_ref->Binding(), facts, refs)) {
 				continue;
 			}
 			for (auto &ref : refs) {
@@ -2027,7 +2034,7 @@ void ResolveWindowPartitionOutputNames(const CreateMVPlanFacts &facts, vector<st
 			}
 			string base_col = ResolveBindingToBaseColumn(bcr, facts);
 			if (!StringUtil::CIEquals(base_col, partition_column) &&
-			    !StringUtil::CIEquals(bcr->GetName(), partition_column)) {
+			    !StringUtil::CIEquals(bcr->GetName().GetIdentifierName(), partition_column)) {
 				continue;
 			}
 			string output_col = ProjectionOutputName(expr, expr_i, output_names, *bcr);
@@ -2084,9 +2091,10 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 		for (auto *ref : facts.join_refs) {
 			string ref_col = ResolveBindingToBaseColumn(ref, facts);
 			if (ref_col.empty()) {
-				ref_col = ref->GetName();
+				ref_col = ref->GetName().GetIdentifierName();
 			}
-			if (!StringUtil::CIEquals(ref_col, group_col) && !StringUtil::CIEquals(ref->GetName(), group_col)) {
+			if (!StringUtil::CIEquals(ref_col, group_col) &&
+			    !StringUtil::CIEquals(ref->GetName().GetIdentifierName(), group_col)) {
 				continue;
 			}
 			string parent = FindBindingParent(parents, BindingKey(*ref));
@@ -2132,7 +2140,7 @@ void ResolveAggregateGroupColumnsThroughJoinKeys(const CreateMVPlanFacts &facts,
 }
 
 static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr, const CreateMVPlanFacts &facts) {
-	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+	if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return "";
 	}
 	auto *ref = dynamic_cast<BoundColumnRefExpression *>(expr.get());
@@ -2140,7 +2148,7 @@ static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr, const 
 		return "";
 	}
 	string col_name = ResolveBindingToBaseColumn(ref, facts);
-	return col_name.empty() ? ref->GetName() : col_name;
+	return col_name.empty() ? ref->GetName().GetIdentifierName() : col_name;
 }
 
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
@@ -2149,8 +2157,8 @@ string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 			continue;
 		}
 		auto &condition = join->conditions[0];
-		string left_col_name = FullOuterJoinColumnName(condition.left, facts);
-		string right_col_name = FullOuterJoinColumnName(condition.right, facts);
+		string left_col_name = FullOuterJoinColumnName(condition.LeftReference(), facts);
+		string right_col_name = FullOuterJoinColumnName(condition.RightReference(), facts);
 		string left_table;
 		string right_table;
 		if (!join->children.empty()) {
@@ -2162,12 +2170,12 @@ string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 			right_table = it == facts.first_table_name.end() ? string() : it->second;
 		}
 		BaseColumnRef left_source, right_source;
-		auto left_ref = GetColumnRefThroughCasts(condition.left.get());
-		auto right_ref = GetColumnRefThroughCasts(condition.right.get());
-		if (left_ref && ResolveBindingToBaseRef(left_ref->binding, facts, left_source)) {
+		auto left_ref = GetColumnRefThroughCasts(condition.LeftReference().get());
+		auto right_ref = GetColumnRefThroughCasts(condition.RightReference().get());
+		if (left_ref && ResolveBindingToBaseRef(left_ref->Binding(), facts, left_source)) {
 			left_table = left_source.table;
 		}
-		if (right_ref && ResolveBindingToBaseRef(right_ref->binding, facts, right_source)) {
+		if (right_ref && ResolveBindingToBaseRef(right_ref->Binding(), facts, right_source)) {
 			right_table = right_source.table;
 		}
 		if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
@@ -2220,8 +2228,8 @@ static void AppendProjectionOutputNames(LogicalProjection &projection, idx_t out
                                         vector<string> &output_names) {
 	while (output_names.size() < output_count) {
 		idx_t idx = output_names.size();
-		if (idx < projection.expressions.size() && !projection.expressions[idx]->alias.empty()) {
-			output_names.push_back(projection.expressions[idx]->alias);
+		if (idx < projection.expressions.size() && !projection.expressions[idx]->GetAlias().empty()) {
+			output_names.push_back(projection.expressions[idx]->GetAlias().GetIdentifierName());
 		} else {
 			output_names.push_back("openivm_col_" + to_string(idx));
 		}
@@ -2234,8 +2242,8 @@ static void AppendAggregateOutputNames(LogicalAggregate &aggregate, idx_t output
 		idx_t idx = output_names.size();
 		if (idx >= group_count) {
 			idx_t expr_idx = idx - group_count;
-			if (expr_idx < aggregate.expressions.size() && !aggregate.expressions[expr_idx]->alias.empty()) {
-				output_names.push_back(aggregate.expressions[expr_idx]->alias);
+			if (expr_idx < aggregate.expressions.size() && !aggregate.expressions[expr_idx]->GetAlias().empty()) {
+				output_names.push_back(aggregate.expressions[expr_idx]->GetAlias().GetIdentifierName());
 				continue;
 			}
 		}
@@ -2296,16 +2304,16 @@ static bool IsAggregateFunctionUnsupportedByLpts(const string &fn_name) {
 }
 
 bool PlanNeedsOriginalSqlForLpts(const CreateMVPlanFacts &facts) {
-	if (facts.has_pivot) {
+	if (facts.has_pivot || facts.analysis.found_unnest || facts.analysis.found_non_foldable_unnest) {
 		return true;
 	}
 	for (auto *aggregate : facts.aggregates) {
 		for (auto &expr : aggregate->expressions) {
-			if (expr->type != ExpressionType::BOUND_AGGREGATE) {
+			if (expr->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
 				continue;
 			}
 			auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-			if (IsAggregateFunctionUnsupportedByLpts(bound_agg.function.name)) {
+			if (IsAggregateFunctionUnsupportedByLpts(bound_agg.Function().GetName().GetIdentifierName())) {
 				return true;
 			}
 		}
@@ -2373,15 +2381,15 @@ static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts,
 			}
 			bool touches_null = false;
 			for (auto &cond : other->conditions) {
-				for (auto *side : {cond.left.get(), cond.right.get()}) {
+				for (auto *side : {cond.LeftReference().get(), cond.RightReference().get()}) {
 					auto *cref = GetColumnRefThroughCasts(side);
 					if (!cref) {
 						continue;
 					}
 					LogicalGet *g = nullptr;
 					string c;
-					if (ResolveBindingToGetColumn(cref->binding, facts, g, c) && g &&
-					    null_tables.count(g->table_index)) {
+					if (ResolveBindingToGetColumn(cref->Binding(), facts, g, c) && g &&
+					    null_tables.count(g->table_index.index)) {
 						touches_null = true;
 						break;
 					}
@@ -2408,15 +2416,15 @@ static bool IsUnfilteredGetSubtree(LogicalOperator *op) {
 	while (op && op->type == LogicalOperatorType::LOGICAL_PROJECTION && op->children.size() == 1) {
 		op = op->children[0].get();
 	}
-	return op && op->type == LogicalOperatorType::LOGICAL_GET && op->Cast<LogicalGet>().table_filters.filters.empty();
+	return op && op->type == LogicalOperatorType::LOGICAL_GET && !op->Cast<LogicalGet>().table_filters.HasFilters();
 }
 
 static bool ColumnIsNotNull(LogicalGet &get, const string &column_name) {
 	auto table = get.GetTable();
-	if (!table.get() || !table.get()->ColumnExists(column_name)) {
+	if (!table.get() || !table.get()->ColumnExists(Identifier(column_name))) {
 		return false;
 	}
-	auto column_index = table.get()->GetColumn(column_name).Logical();
+	auto column_index = table.get()->GetColumn(Identifier(column_name)).Logical();
 	for (auto &constraint : table.get()->GetConstraints()) {
 		if (constraint->type == ConstraintType::NOT_NULL &&
 		    constraint->Cast<NotNullConstraint>().index == column_index) {
@@ -2453,9 +2461,9 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		return "";
 	}
 	auto &condition = oj->conditions[0];
-	if (condition.comparison != ExpressionType::COMPARE_EQUAL ||
-	    condition.left->expression_class != ExpressionClass::BOUND_COLUMN_REF ||
-	    condition.right->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
+	if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL ||
+	    condition.GetLHS().GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF ||
+	    condition.GetRHS().GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return "";
 	}
 	// Every LEFT JOIN level needs the secondary, including a SINGLE left join whose preserved side is a
@@ -2471,19 +2479,20 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		return "";
 	}
 	// Deepest-join keys: condition.left = preserved side, condition.right = inner (null) side.
-	auto &pres_ref = condition.left->Cast<BoundColumnRefExpression>();
-	auto &inner_ref = condition.right->Cast<BoundColumnRefExpression>();
-	ColumnBinding key_pres = pres_ref.binding;
+	auto &pres_ref = condition.GetLHS().Cast<BoundColumnRefExpression>();
+	auto &inner_ref = condition.GetRHS().Cast<BoundColumnRefExpression>();
+	ColumnBinding key_pres = pres_ref.Binding();
 	LogicalGet *inner_get = nullptr;
 	string inner_col;
-	if (!ResolveBindingToGetColumn(inner_ref.binding, facts, inner_get, inner_col) || !inner_get ||
+	if (!ResolveBindingToGetColumn(inner_ref.Binding(), facts, inner_get, inner_col) || !inner_get ||
 	    !inner_get->GetTable().get()) {
 		return "";
 	}
-	idx_t inner_tidx = inner_get->table_index;
-	string inner_table = inner_get->GetTable().get()->name;
-	auto sti = facts.source_table_info.find(SqlUtils::FullName(inner_get->GetTable()->ParentCatalog().GetName(),
-	                                                           inner_get->GetTable()->schema.name, inner_table));
+	idx_t inner_tidx = inner_get->table_index.index;
+	string inner_table = inner_get->GetTable().get()->name.GetIdentifierName();
+	auto sti = facts.source_table_info.find(SqlUtils::FullName(
+	    inner_get->GetTable()->ParentCatalog().GetName().GetIdentifierName(),
+	    inner_get->GetTable()->schema.name.GetIdentifierName(), inner_table));
 	if (sti == facts.source_table_info.end()) {
 		return "";
 	}
@@ -2510,16 +2519,17 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get || !pres_get->GetTable().get()) {
 		return "";
 	}
-	string pres_table = pres_get->GetTable().get()->name;
-	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_table, inner_table)) {
+	string pres_table = pres_get->GetTable().get()->name.GetIdentifierName();
+	if (pres_get->table_index.index == inner_tidx || StringUtil::CIEquals(pres_table, inner_table)) {
 		// Self-referencing deepest join (preserved and inner sides are the same base table): the
 		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
 		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
 		// shape.
 		return "";
 	}
-	auto pres_sti = facts.source_table_info.find(SqlUtils::FullName(pres_get->GetTable()->ParentCatalog().GetName(),
-	                                                                pres_get->GetTable()->schema.name, pres_table));
+	auto pres_sti = facts.source_table_info.find(SqlUtils::FullName(
+	    pres_get->GetTable()->ParentCatalog().GetName().GetIdentifierName(),
+	    pres_get->GetTable()->schema.name.GetIdentifierName(), pres_table));
 	if (pres_sti == facts.source_table_info.end()) {
 		return "";
 	}
@@ -2543,23 +2553,23 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	for (size_t j = 0; j < num_agg; j++) {
 		if (j < agg.expressions.size()) {
 			auto &e = agg.expressions[j];
-			if (e->expression_class != ExpressionClass::BOUND_AGGREGATE) {
+			if (e->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
 				return "";
 			}
 			auto &ba = e->Cast<BoundAggregateExpression>();
-			string fn = StringUtil::Lower(ba.function.name);
-			if (ba.children.empty()) {
+	string fn = StringUtil::Lower(ba.Function().GetName().GetIdentifierName());
+			if (ba.GetChildren().empty()) {
 				contribs.push_back("1"); // count_star: null-padded row still counts
 				continue;
 			}
-			auto *cref = GetColumnRefThroughCasts(ba.children[0].get());
+			auto *cref = GetColumnRefThroughCasts(ba.GetChildren()[0].get());
 			if (!cref) {
 				return "";
 			}
 			LogicalGet *g = nullptr;
 			string c;
-			bool resolved = ResolveBindingToGetColumn(cref->binding, facts, g, c);
-			bool is_inner = resolved && g && null_tables.count(g->table_index) > 0;
+			bool resolved = ResolveBindingToGetColumn(cref->Binding(), facts, g, c);
+			bool is_inner = resolved && g && null_tables.count(g->table_index.index) > 0;
 			if (fn == "count") {
 				if (!is_inner && (!resolved || !g || !ColumnIsNotNull(*g, c))) {
 					return "";
@@ -2603,7 +2613,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		if (!gr) {
 			return "";
 		}
-		group_bindings.push_back(gr->binding);
+		group_bindings.push_back(gr->Binding());
 	}
 	vector<string> x_names(x_bindings.size());
 	int key_pos = -1;

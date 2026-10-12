@@ -20,7 +20,7 @@ DeltaPlanFragment CompileProjectionDelta(DeltaOperatorInput input) {
 	projection_node->expressions.emplace_back(std::move(mul_expression));
 	projection_node->types.clear();
 	for (auto &expr : projection_node->expressions) {
-		projection_node->types.push_back(expr->return_type);
+		projection_node->types.push_back(expr->GetReturnType());
 	}
 
 	const auto new_bindings = projection_node->GetColumnBindings();

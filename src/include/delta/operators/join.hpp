@@ -24,6 +24,9 @@ void DemoteLeftJoins(LogicalOperator *node);
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding);
 
+void RemapParentProjectionMapForInsertedOutput(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
+                                              idx_t original_child_width, const ColumnBinding &mul_binding);
+
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,
                                                 bool preserve_constant_sibling_child_outputs = false,

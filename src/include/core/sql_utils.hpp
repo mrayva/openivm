@@ -41,7 +41,7 @@ public:
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
 	static bool GetBoolSetting(ClientContext &context, const string &setting_name, bool default_value) {
 		Value setting_value;
-		if (context.TryGetCurrentSetting(setting_name, setting_value) && !setting_value.IsNull()) {
+		if (context.TryGetCurrentSetting(Identifier(setting_name), setting_value) && !setting_value.IsNull()) {
 			return setting_value.GetValue<bool>();
 		}
 		return default_value;

@@ -93,18 +93,19 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 		return false;
 	}
 	auto &join = op.Cast<LogicalComparisonJoin>();
-	if (!IsSemiAntiJoinType(join.join_type) || join.conditions.empty() || join.predicate) {
+	if (!IsSemiAntiJoinType(join.join_type) || join.conditions.empty()) {
 		return false;
 	}
 	for (auto &condition : join.conditions) {
 		// This gate only selects the cheaper rewrite; rejecting equality retains the equivalent DELIM_JOIN fallback.
-		if (condition.comparison != ExpressionType::COMPARE_EQUAL && // mull-ignore: cxx_ne_to_eq
-		    condition.comparison != ExpressionType::COMPARE_NOT_DISTINCT_FROM) {
+		if (!condition.IsComparison() ||
+		    (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL && // mull-ignore: cxx_ne_to_eq
+		     condition.GetComparisonType() != ExpressionType::COMPARE_NOT_DISTINCT_FROM)) {
 			return false;
 		}
 	}
 	for (auto &expr : join.duplicate_eliminated_columns) {
-		if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
 	}
@@ -141,7 +142,7 @@ static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
 						continue;
 					}
 					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
-						proj_map.push_back(binding_idx);
+						proj_map.push_back(ProjectionIndex(binding_idx));
 					}
 				}
 			}
@@ -172,25 +173,25 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 	vector<unique_ptr<Expression>> exprs;
 	exprs.reserve(delim_join.duplicate_eliminated_columns.size());
 	for (auto &expr : delim_join.duplicate_eliminated_columns) {
-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			throw NotImplementedException("DELIM_JOIN duplicate-eliminated expression must be a column reference");
 		}
 		auto &col_ref = expr->Cast<BoundColumnRefExpression>();
 		idx_t source_ordinal = DConstants::INVALID_INDEX;
 		for (idx_t i = 0; i < source_bindings.size(); i++) {
-			if (source_bindings[i] == col_ref.binding) {
+			if (source_bindings[i] == col_ref.Binding()) {
 				source_ordinal = i;
 				break;
 			}
 		}
 		if (source_ordinal == DConstants::INVALID_INDEX) {
 			if (!allow_ordinal_fallback ||
-			    col_ref.binding.column_index >= copy_bindings.size()) { // mull-ignore: cxx_ge_to_gt
+			    col_ref.Binding().column_index >= copy_bindings.size()) { // mull-ignore: cxx_ge_to_gt
 				throw InternalException("DELIM_JOIN duplicate-eliminated binding not found in source child");
 			}
-			source_ordinal = col_ref.binding.column_index;
+			source_ordinal = col_ref.Binding().column_index;
 		}
-		exprs.push_back(make_uniq<BoundColumnRefExpression>(col_ref.return_type, copy_bindings[source_ordinal]));
+		exprs.push_back(make_uniq<BoundColumnRefExpression>(col_ref.GetReturnType(), copy_bindings[source_ordinal]));
 	}
 	if (exprs.empty()) {
 		throw NotImplementedException("DELIM_JOIN without duplicate-eliminated columns is not supported");
@@ -215,7 +216,8 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer);
 
 static uint64_t BindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+	return (uint64_t)binding.table_index.index ^
+	       ((uint64_t)binding.column_index.GetIndexUnsafe() * 0x9e3779b97f4a7c15ULL);
 }
 
 static void AddColumnBindingReplacements(const vector<ColumnBinding> &old_bindings,
@@ -251,9 +253,9 @@ static void AddLeafBindingReplacements(const vector<ColumnBinding> &old_bindings
 
 static ColumnBinding MapTermBinding(ColumnBinding binding, const unordered_map<old_idx, new_idx> &idx_map,
                                     const vector<ReplacementBinding> &replacement_bindings) {
-	auto idx_entry = idx_map.find(binding.table_index);
+	auto idx_entry = idx_map.find(binding.table_index.index);
 	if (idx_entry != idx_map.end()) {
-		binding.table_index = idx_entry->second;
+		binding.table_index = TableIndex(idx_entry->second);
 	}
 
 	// At most N replacements can be followed. The inclusive final pass detects a cycle instead of returning midway.
@@ -291,10 +293,11 @@ static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_binding
 		if (!candidates.empty()) {
 			candidates += ", ";
 		}
-		candidates += to_string(binding.table_index) + ":" + to_string(binding.column_index);
+		candidates += to_string(binding.table_index.index) + ":" +
+		              to_string(binding.column_index.GetIndexUnsafe());
 	}
 	throw InternalException("DeltaDelimJoin: original output binding %llu:%llu not found in rewritten term [%s]",
-	                        (idx_t)target.table_index, (idx_t)target.column_index, candidates.c_str());
+	                        target.table_index.index, target.column_index.GetIndexUnsafe(), candidates.c_str());
 }
 
 static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,
@@ -355,11 +358,13 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
 	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
 		auto &join = op.Cast<LogicalComparisonJoin>();
 		for (auto &condition : join.conditions) {
-			if (condition.left) {
-				replacer.VisitExpression(&condition.left);
-			}
-			if (condition.right) {
-				replacer.VisitExpression(&condition.right);
+			if (condition.IsComparison()) {
+				replacer.VisitExpression(&condition.LeftReference());
+				replacer.VisitExpression(&condition.RightReference());
+			} else {
+				auto condition_expr = condition.GetJoinExpression().Copy();
+				replacer.VisitExpression(&condition_expr);
+				condition = JoinCondition(std::move(condition_expr));
 			}
 		}
 		for (auto &expr : join.duplicate_eliminated_columns) {
@@ -367,9 +372,6 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
 				continue;
 			}
 			replacer.VisitExpression(&expr);
-		}
-		if (join.predicate) {
-			replacer.VisitExpression(&join.predicate);
 		}
 	}
 	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {

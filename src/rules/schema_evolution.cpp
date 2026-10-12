@@ -78,7 +78,7 @@ static void AddAlias(unordered_set<string> &aliases, const string &alias) {
 
 static void AddLocalTableAliases(TableRef &ref, const string &table_name, unordered_set<string> &all_aliases,
                                  unordered_set<string> &target_aliases) {
-	AddAlias(all_aliases, ref.alias);
+	AddAlias(all_aliases, ref.alias.GetIdentifierName());
 	if (ref.type == TableReferenceType::JOIN) {
 		auto &join = ref.Cast<JoinRef>();
 		AddLocalTableAliases(*join.left, table_name, all_aliases, target_aliases);
@@ -89,20 +89,22 @@ static void AddLocalTableAliases(TableRef &ref, const string &table_name, unorde
 		return;
 	}
 	auto &base = ref.Cast<BaseTableRef>();
-	AddAlias(all_aliases, base.table_name);
-	auto source_name = SqlUtils::QuoteIdentifier(base.table_name);
-	if (!base.schema_name.empty()) {
-		source_name = SqlUtils::QuoteIdentifier(base.schema_name) + "." + source_name;
+	const auto &qualified_name = base.GetQualifiedName();
+	auto table_identifier = qualified_name.Name().GetIdentifierName();
+	AddAlias(all_aliases, table_identifier);
+	auto source_name = SqlUtils::QuoteIdentifier(table_identifier);
+	if (!qualified_name.Schema().empty()) {
+		source_name = SqlUtils::QuoteIdentifier(qualified_name.Schema().GetIdentifierName()) + "." + source_name;
 	}
-	if (!base.catalog_name.empty()) {
-		source_name = SqlUtils::QuoteIdentifier(base.catalog_name) + "." + source_name;
+	if (!qualified_name.Catalog().empty()) {
+		source_name = SqlUtils::QuoteIdentifier(qualified_name.Catalog().GetIdentifierName()) + "." + source_name;
 	}
 	if (!NamesMatch(source_name, table_name)) {
 		return;
 	}
-	AddAlias(target_aliases, base.table_name);
+	AddAlias(target_aliases, table_identifier);
 	if (!ref.alias.empty()) {
-		AddAlias(target_aliases, ref.alias);
+		AddAlias(target_aliases, ref.alias.GetIdentifierName());
 	}
 }
 
@@ -123,11 +125,12 @@ static unordered_set<string> ApplyLocalAliases(const unordered_set<string> &inhe
 
 static bool ColumnRefTargetsTable(const ColumnRefExpression &ref, const unordered_set<string> &aliases,
                                   bool allow_unqualified) {
-	if (ref.column_names.size() == 1) {
+	const auto &column_names = ref.ColumnNames();
+	if (column_names.size() == 1) {
 		return allow_unqualified;
 	}
-	for (idx_t i = 0; i + 1 < ref.column_names.size(); i++) {
-		if (aliases.count(StringUtil::Lower(ref.column_names[i]))) {
+	for (idx_t i = 0; i + 1 < column_names.size(); i++) {
+		if (aliases.count(StringUtil::Lower(column_names[i].GetIdentifierName()))) {
 			return true;
 		}
 	}
@@ -145,14 +148,15 @@ static bool RewriteExpressionScoped(unique_ptr<ParsedExpression> &expr, const st
 	}
 	bool changed = false;
 	ParsedExpressionIterator::VisitExpressionMutable<SubqueryExpression>(*expr, [&](SubqueryExpression &subquery) {
-		if (subquery.subquery && subquery.subquery->node) {
-			changed |= RewriteQueryNodeScoped(*subquery.subquery->node, table_name, old_name, new_name, target_aliases);
+		if (subquery.Subquery() && subquery.Subquery()->node) {
+			changed |= RewriteQueryNodeScoped(*subquery.Subquery()->node, table_name, old_name, new_name, target_aliases);
 		}
 	});
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*expr, [&](ColumnRefExpression &ref) {
-		if (!ref.column_names.empty() && StringUtil::CIEquals(ref.column_names.back(), old_name) &&
+		auto &column_names = ref.ColumnNamesMutable();
+		if (!column_names.empty() && StringUtil::CIEquals(column_names.back().GetIdentifierName(), old_name) &&
 		    ColumnRefTargetsTable(ref, target_aliases, allow_unqualified)) {
-			ref.column_names.back() = new_name;
+			column_names.back() = Identifier(new_name);
 			changed = true;
 		}
 	});
@@ -253,7 +257,7 @@ static bool RewriteQueryNodeScoped(QueryNode &node, const string &table_name, co
 	bool changed = false;
 	for (auto &kv : node.cte_map.map) {
 		changed |=
-		    RewriteQueryNodeScoped(*kv.second->query->node, table_name, old_name, new_name, inherited_target_aliases);
+		    RewriteQueryNodeScoped(*kv.second->query_node, table_name, old_name, new_name, inherited_target_aliases);
 	}
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
@@ -303,7 +307,7 @@ static void PreserveTopLevelOutputAliases(SelectStatement &stmt, const vector<st
 		return;
 	}
 	for (idx_t i = 0; i < output_columns.size(); i++) {
-		select.select_list[i]->alias = output_columns[i];
+		select.select_list[i]->SetAlias(Identifier(output_columns[i]));
 	}
 }
 

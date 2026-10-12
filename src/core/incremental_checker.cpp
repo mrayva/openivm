@@ -10,6 +10,7 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_dependent_join.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_positional_join.hpp"
 #include "duckdb/planner/operator/logical_sample.hpp"
 #include "duckdb/planner/operator/logical_window.hpp"
@@ -30,11 +31,11 @@ static const unordered_set<string> &GetSupportedAggregates() {
 }
 
 static bool WindowColumn(const Expression &expr, string &name) {
-	if (expr.type != ExpressionType::BOUND_COLUMN_REF) {
+	if (expr.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &column = expr.Cast<BoundColumnRefExpression>();
-	name = column.alias.empty() ? column.GetName() : column.alias;
+	name = column.GetAlias().empty() ? column.GetName().GetIdentifierName() : column.GetAlias().GetIdentifierName();
 	return !name.empty();
 }
 
@@ -52,11 +53,11 @@ static bool SameWindowColumns(const vector<string> &left, const vector<string> &
 
 static bool HasSimpleOrderBy(const vector<BoundOrderByNode> &orders) {
 	for (auto &order : orders) {
-		if (order.expression->type != ExpressionType::BOUND_COLUMN_REF) {
+		if (order.expression->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 			return false;
 		}
 		auto &column = order.expression->Cast<BoundColumnRefExpression>();
-		if (column.alias.empty() && column.GetName().empty()) {
+		if (column.GetAlias().empty() && column.GetName().empty()) {
 			return false;
 		}
 	}
@@ -68,13 +69,14 @@ static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
 	for (auto &expr : expressions) {
 		bool found_volatile = false;
 		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
-			if (child.expression_class == ExpressionClass::BOUND_FUNCTION) {
+			if (child.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
 				auto &func = child.Cast<BoundFunctionExpression>();
-				if (func.function.name.rfind("__internal_compress", 0) == 0 ||
-				    func.function.name.rfind("__internal_decompress", 0) == 0 || func.function.name == "error") {
+				auto &function_name = func.Function().GetName().GetIdentifierName();
+				if (function_name.rfind("__internal_compress", 0) == 0 ||
+				    function_name.rfind("__internal_decompress", 0) == 0 || function_name == "error") {
 					return;
 				}
-				if (func.function.GetStability() != FunctionStability::CONSISTENT) {
+				if (func.Function().GetStability() != FunctionStability::CONSISTENT) {
 					found_volatile = true;
 				}
 			}
@@ -90,9 +92,9 @@ static bool HasNonFoldableUnnestExpression(vector<unique_ptr<Expression>> &expre
 	for (auto &expr : expressions) {
 		bool found_non_foldable_unnest = false;
 		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
-			if (child.expression_class == ExpressionClass::BOUND_UNNEST) {
+			if (child.GetExpressionClass() == ExpressionClass::BOUND_UNNEST) {
 				auto &unnest = child.Cast<BoundUnnestExpression>();
-				if (!unnest.child || !unnest.child->IsFoldable()) {
+				if (!unnest.Child() || !unnest.Child()->IsFoldable()) {
 					found_non_foldable_unnest = true;
 				}
 			}
@@ -107,6 +109,7 @@ static bool HasNonFoldableUnnestExpression(vector<unique_ptr<Expression>> &expre
 static void MergeCompatibilityAndNonLocalFacts(PlanAnalysis &result, const PlanAnalysis &body) {
 	result.incremental_compatible = result.incremental_compatible && body.incremental_compatible;
 	result.found_volatile_expression = result.found_volatile_expression || body.found_volatile_expression;
+	result.found_unnest = result.found_unnest || body.found_unnest;
 	result.found_non_foldable_unnest = result.found_non_foldable_unnest || body.found_non_foldable_unnest;
 	result.found_unsupported_aggregate = result.found_unsupported_aggregate || body.found_unsupported_aggregate;
 	result.found_unsupported_filtered_aggregate =
@@ -126,7 +129,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
 	case LogicalOperatorType::LOGICAL_INSERT:
 	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_GET:
+	case LogicalOperatorType::LOGICAL_EMPTY_RESULT:
 	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
 	case LogicalOperatorType::LOGICAL_CHUNK_GET:
 	case LogicalOperatorType::LOGICAL_DELIM_GET:
@@ -134,7 +137,14 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_ORDER_BY:
 		break;
 
+	case LogicalOperatorType::LOGICAL_GET:
+		if (StringUtil::CIEquals(node->Cast<LogicalGet>().function.name.GetIdentifierName(), "unnest")) {
+			result.found_unnest = true;
+		}
+		break;
+
 	case LogicalOperatorType::LOGICAL_UNNEST:
+		result.found_unnest = true;
 		if (HasVolatileExpression(node->expressions)) {
 			result.incremental_compatible = false;
 			result.found_volatile_expression = true;
@@ -267,12 +277,13 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 				result.found_grouping_sets = true;
 			}
 			for (auto &expr : agg->expressions) {
-				if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
+				if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
 					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
 					const auto &supported = GetSupportedAggregates();
 					const bool scalar_subquery_first =
-					    bound_agg.function.name == "first" && result.group_index != DConstants::INVALID_INDEX;
-					if (supported.find(bound_agg.function.name) == supported.end() && !scalar_subquery_first) {
+					    bound_agg.Function().GetName() == "first" && result.group_index != DConstants::INVALID_INDEX;
+					if (supported.find(bound_agg.Function().GetName().GetIdentifierName()) == supported.end() &&
+					    !scalar_subquery_first) {
 						result.incremental_compatible = false;
 						result.found_unsupported_aggregate = true;
 					}
@@ -281,11 +292,11 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 					if (bound_agg.IsDistinct()) {
 						result.found_count_distinct = true;
 					}
-					if (bound_agg.filter) {
+					if (bound_agg.GetFilter()) {
 						// LIST keeps NULL elements, so LIST(CASE WHEN p THEN x ELSE NULL END)
 						// is not equivalent to LIST(x) FILTER (WHERE p). Keep the raw FILTER
 						// and route the view to affected-group recompute using the original SQL.
-						if (bound_agg.function.name == "list") {
+						if (bound_agg.Function().GetName() == "list") {
 							result.found_filtered_list = true;
 						} else {
 							// Other FILTER aggregates should have been normalized before the
@@ -294,8 +305,8 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 							result.found_unsupported_filtered_aggregate = true;
 						}
 					}
-					if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
-					    bound_agg.function.name == "arg_min" || bound_agg.function.name == "arg_max") {
+					if (bound_agg.Function().GetName() == "min" || bound_agg.Function().GetName() == "max" ||
+					    bound_agg.Function().GetName() == "arg_min" || bound_agg.Function().GetName() == "arg_max") {
 						result.found_minmax = true;
 					}
 					// LIST aggregates aren't element-wise summable — different deltas
@@ -303,7 +314,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 					// upsert compiler uses group-recompute (delete affected groups,
 					// re-insert from the original query) rather than the failing
 					// list_reduce/lambda path.
-					if (bound_agg.function.name == "list") {
+					if (bound_agg.Function().GetName() == "list") {
 						result.found_list = true;
 					}
 					// Record aggregate function types only for the outermost aggregate in the plan.
@@ -312,7 +323,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 					// Compatibility flags (found_minmax, found_list, found_count_distinct) are
 					// recorded for all aggregates above so unsafe inner aggs still gate classification.
 					if (result.group_index == DConstants::INVALID_INDEX) {
-						result.aggregate_types.push_back(bound_agg.function.name);
+						result.aggregate_types.push_back(bound_agg.Function().GetName().GetIdentifierName());
 					}
 				}
 			}
@@ -325,7 +336,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 			// with an inner aggregate's binding causes find_group_cols to miss the top projection.
 			if (result.group_index == DConstants::INVALID_INDEX) {
 				result.group_count = agg->groups.size();
-				result.group_index = agg->group_index;
+				result.group_index = agg->group_index.index;
 			} else {
 				// A second aggregate node below the outermost one → nested aggregate pattern.
 				// COUNT(*)/COUNT(x) in the outer aggregate counts inner-group rows, not source rows,
@@ -349,15 +360,15 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		// key is unique; differing or computed window keys keep the existing
 		// partition-recompute path.
 		for (auto &expr : window.expressions) {
-			if (expr->expression_class == ExpressionClass::BOUND_WINDOW) {
+				if (expr->GetExpressionClass() == ExpressionClass::BOUND_WINDOW) {
 				auto &win_expr = expr->Cast<BoundWindowExpression>();
 				vector<string> current_partitions;
 				vector<string> current_orders;
-				for (auto &part : win_expr.partitions) {
+					for (auto &part : win_expr.Partitions()) {
 					string col_name;
 					if (!WindowColumn(*part, col_name)) {
 						result.window_row_key_compatible = false;
-						col_name = part->GetName();
+							col_name = part->GetName().GetIdentifierName();
 					}
 					current_partitions.push_back(col_name);
 					// Avoid duplicates
@@ -372,7 +383,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 						result.window_partition_columns.push_back(col_name);
 					}
 				}
-				for (auto &order : win_expr.orders) {
+					for (auto &order : win_expr.OrderBy()) {
 					string col_name;
 					if (!WindowColumn(*order.expression, col_name)) {
 						result.window_row_key_compatible = false;

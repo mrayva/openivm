@@ -1255,14 +1255,16 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 		throw InvalidInputException("Invalid materialized view name '%s'; use [catalog.][schema.]view", view_name);
 	}
 	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	resolved.view_catalog_name = entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : entry.catalog;
-	resolved.view_schema_name = entry.schema.empty() ? DEFAULT_SCHEMA : entry.schema;
+	resolved.view_catalog_name = entry.GetCatalog().empty()
+	                                 ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
+	                                 : entry.GetCatalog().GetIdentifierName();
+	resolved.view_schema_name = entry.GetSchema().empty() ? DEFAULT_SCHEMA : entry.GetSchema().GetIdentifierName();
 	auto name = parts.back();
 	if (parts.size() == 3) {
 		resolved.view_catalog_name = parts[0];
 		resolved.view_schema_name = parts[1];
 	} else if (parts.size() == 2) {
-		if (DatabaseManager::Get(context).GetDatabase(context, parts[0])) {
+		if (DatabaseManager::Get(context).GetDatabase(context, Identifier(parts[0]))) {
 			resolved.view_catalog_name = parts[0];
 			resolved.view_schema_name = DEFAULT_SCHEMA;
 		} else {
@@ -1457,10 +1459,11 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 	openivm::TimeTravelPins pins;
 	con.context->RunFunctionInTransaction([&]() {
 		pins = openivm::TimeTravelPins::Peel(*con.context, *parser.statements.at(0), [&](BaseTableRef &ref) {
-			auto location = locations.find(ref.table_name);
-			if (location != locations.end() && ref.catalog_name.empty() && ref.schema_name.empty()) {
-				ref.catalog_name = location->second.catalog_name;
-				ref.schema_name = location->second.schema_name;
+			auto &qualified_name = ref.GetQualifiedName();
+			auto location = locations.find(qualified_name.Name().GetIdentifierName());
+			if (location != locations.end() && qualified_name.Catalog().empty() && qualified_name.Schema().empty()) {
+				ref.SetQualifiedName(Identifier(location->second.catalog_name), Identifier(location->second.schema_name),
+				                     qualified_name.Name());
 				qualified = true;
 			}
 		});

@@ -88,8 +88,9 @@ struct RunningWindowPlan {
 };
 
 static string RunningColumn(const ParsedExpression &expr) {
-	return expr.GetExpressionClass() == ExpressionClass::COLUMN_REF ? expr.Cast<ColumnRefExpression>().GetColumnName()
-	                                                                : "";
+	return expr.GetExpressionClass() == ExpressionClass::COLUMN_REF
+	           ? expr.Cast<ColumnRefExpression>().GetColumnName().GetIdentifierName()
+	           : "";
 }
 
 static bool ParseRunningWindowExpression(const ParsedExpression &expression, RunningWindowExpr &out,
@@ -98,33 +99,36 @@ static bool ParseRunningWindowExpression(const ParsedExpression &expression, Run
 		return false;
 	}
 	auto &window = expression.Cast<WindowExpression>();
-	auto function = StringUtil::Lower(window.function_name);
+	auto function = StringUtil::Lower(window.FunctionName().GetIdentifierName());
 	if (function == "count_star") {
 		function = "count";
 	}
 	if ((function != "sum" && function != "min" && function != "max" && function != "count" && function != "avg" &&
 	     function != "row_number") ||
-	    window.partitions.size() != 1 || window.orders.size() != 1 || window.children.size() > 1 ||
-	    window.filter_expr || window.distinct || !window.arg_orders.empty() ||
-	    window.exclude_clause != WindowExcludeMode::NO_OTHER || window.start != WindowBoundary::UNBOUNDED_PRECEDING ||
-	    (window.end != WindowBoundary::CURRENT_ROW_RANGE && window.end != WindowBoundary::CURRENT_ROW_ROWS) ||
-	    window.orders[0].type == OrderType::DESCENDING) {
+	    window.Partitions().size() != 1 || window.OrderBy().size() != 1 || window.GetArguments().size() > 1 ||
+	    window.Filter() || window.Distinct() || !window.ArgOrders().empty() ||
+	    window.WindowExclude() != WindowExcludeMode::NO_OTHER ||
+	    window.WindowStart() != WindowBoundary::UNBOUNDED_PRECEDING ||
+	    (window.WindowEnd() != WindowBoundary::CURRENT_ROW_RANGE &&
+	     window.WindowEnd() != WindowBoundary::CURRENT_ROW_ROWS) ||
+	    window.OrderBy()[0].type == OrderType::DESCENDING) {
 		return false;
 	}
-	auto partition = RunningColumn(*window.partitions[0]);
-	auto order = RunningColumn(*window.orders[0].expression);
+	auto partition = RunningColumn(*window.Partitions()[0]);
+	auto order = RunningColumn(*window.OrderBy()[0].expression);
 	if (partition.empty() || order.empty() ||
 	    (!partition_col.empty() && !StringUtil::CIEquals(partition_col, partition)) ||
 	    (!order_col.empty() && !StringUtil::CIEquals(order_col, order))) {
 		return false;
 	}
 	out.function_name = function;
-	out.rows_frame = window.end == WindowBoundary::CURRENT_ROW_ROWS;
-	out.nulls_first = window.orders[0].null_order == OrderByNullType::NULLS_FIRST;
-	out.argument = window.children.empty() && (function == "count" || function == "row_number") ? "*"
-	               : window.children.empty()                                                    ? ""
-	                                         : RunningColumn(*window.children[0]);
-	out.output_column = expression.GetName();
+	out.rows_frame = window.WindowEnd() == WindowBoundary::CURRENT_ROW_ROWS;
+	out.nulls_first = window.OrderBy()[0].null_order == OrderByNullType::NULLS_FIRST;
+	const auto &arguments = window.GetArguments();
+	out.argument = arguments.empty() && (function == "count" || function == "row_number")
+	                   ? "*"
+	                   : arguments.empty() ? "" : RunningColumn(arguments[0].GetExpression());
+	out.output_column = expression.GetName().GetIdentifierName();
 	partition_col = partition;
 	order_col = order;
 	return !out.argument.empty();
@@ -158,8 +162,9 @@ static SelectNode *RunningSelect(QueryNode &node) {
 
 static string RefreshExpressionSQL(ParsedExpression &expression) {
 	// Resolve builtin cast names so portable SQL uses DATE rather than an unresolved quoted type name.
-	ParsedExpressionIterator::VisitExpressionMutable<CastExpression>(
-	    expression, [&](CastExpression &cast) { cast.cast_type = UnboundType::TryDefaultBind(cast.cast_type); });
+	ParsedExpressionIterator::VisitExpressionMutable<CastExpression>(expression, [&](CastExpression &cast) {
+		cast.SetTargetType(TypeExpression::FromLogicalType(UnboundType::TryDefaultBind(cast.TargetType())));
+	});
 	return expression.ToString();
 }
 
@@ -168,11 +173,11 @@ static string TranslateExpressionIdentifiers(const ParsedExpression &expression,
 	auto copy = expression.Copy();
 	bool resolved = true;
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*copy, [&](ColumnRefExpression &column) {
-		auto found = alias_to_output.find(StringUtil::Lower(column.GetColumnName()));
+		auto found = alias_to_output.find(StringUtil::Lower(column.GetColumnName().GetIdentifierName()));
 		if (found == alias_to_output.end()) {
 			resolved = false;
 		} else {
-			column.column_names = {found->second};
+			column.ColumnNamesMutable() = {Identifier(found->second)};
 		}
 	});
 	return resolved ? RefreshExpressionSQL(*copy) : "";
@@ -201,13 +206,13 @@ static bool TryParseRunningWindowPlan(SelectNode &select, const vector<string> &
 			if (source.empty()) {
 				return false;
 			}
-			plan.passthrough_columns.emplace_back(source, item->GetName());
+			plan.passthrough_columns.emplace_back(source, item->GetName().GetIdentifierName());
 		}
 	}
 	for (auto &column : column_names) {
 		bool found = false;
 		for (auto &item : select.select_list) {
-			found = found || StringUtil::CIEquals(column, item->GetName());
+		found = found || StringUtil::CIEquals(column, item->GetName().GetIdentifierName());
 		}
 		if (!found) {
 			return false;
@@ -223,7 +228,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 		return false;
 	}
 	auto &scan_cte = *select.cte_map.map.begin()->second;
-	auto *scan = RunningSelect(*scan_cte.query->node);
+	auto *scan = RunningSelect(*scan_cte.query_node);
 	if (!scan || scan_cte.aliases.size() != scan->select_list.size()) {
 		return false;
 	}
@@ -234,7 +239,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 		if (source.empty()) {
 			return false;
 		}
-		auto alias = StringUtil::Lower(scan_cte.aliases[i]);
+		auto alias = StringUtil::Lower(scan_cte.aliases[i].GetIdentifierName());
 		plan.source_columns.push_back(source);
 		alias_to_source[alias] = source;
 		alias_to_output[alias] = source;
@@ -245,26 +250,26 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 			output_names = column_names;
 			break;
 		}
-		output_names.push_back(item->GetName());
+		output_names.push_back(item->GetName().GetIdentifierName());
 	}
 	plan.output_columns = output_names;
 	// Resolve final output names through passthrough CTEs once. Window outputs need
 	// not appear in function order, and hidden positions are appended at the end.
 	std::map<string, string> final_names;
 	for (auto &item : select.select_list) {
-		final_names[StringUtil::Lower(RunningColumn(*item))] = item->GetName();
+		final_names[StringUtil::Lower(RunningColumn(*item))] = item->GetName().GetIdentifierName();
 	}
 	vector<CommonTableExpressionInfo *> ctes;
 	for (auto &entry : select.cte_map.map) {
 		ctes.push_back(entry.second.get());
 	}
 	for (auto it = ctes.rbegin(); it != ctes.rend(); ++it) {
-		auto *body = RunningSelect(*(*it)->query->node);
+		auto *body = RunningSelect(*(*it)->query_node);
 		if (!body || (*it)->aliases.size() != body->select_list.size()) {
 			return false;
 		}
 		for (idx_t i = 0; i < body->select_list.size(); i++) {
-			auto target = final_names.find(StringUtil::Lower((*it)->aliases[i]));
+		auto target = final_names.find(StringUtil::Lower((*it)->aliases[i].GetIdentifierName()));
 			auto source = RunningColumn(*body->select_list[i]);
 			if (target != final_names.end() && !source.empty()) {
 				final_names.emplace(StringUtil::Lower(source), target->second);
@@ -284,7 +289,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 	string parsed_order;
 	for (auto &entry : select.cte_map.map) {
 		auto &cte = *entry.second;
-		auto *body = RunningSelect(*cte.query->node);
+		auto *body = RunningSelect(*cte.query_node);
 		if (!body || cte.aliases.size() != body->select_list.size()) {
 			return false;
 		}
@@ -295,7 +300,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 		string position_column;
 		for (idx_t item_idx = 0; item_idx < cte_items.size(); item_idx++) {
 			auto &item = cte_items[item_idx];
-			string output_alias = cte_aliases[item_idx];
+			string output_alias = cte_aliases[item_idx].GetIdentifierName();
 			string output_key = StringUtil::Lower(output_alias);
 			if (item->GetExpressionClass() != ExpressionClass::WINDOW) {
 				string source_key = StringUtil::Lower(RunningColumn(*item));
@@ -609,10 +614,10 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	// Apply the partition restriction at the source, before blocking window operators.
 	// The suffix parser proved that every window uses this same partition key.
 	auto *scan =
-	    select->cte_map.map.empty() ? select : RunningSelect(*select->cte_map.map.begin()->second->query->node);
+	    select->cte_map.map.empty() ? select : RunningSelect(*select->cte_map.map.begin()->second->query_node);
 	D_ASSERT(scan && !scan->where_clause);
 	auto &source = scan->from_table->Cast<BaseTableRef>();
-	auto source_alias = source.alias.empty() ? source.table_name : source.alias;
+	auto source_alias = source.alias.empty() ? source.Table().GetIdentifierName() : source.alias.GetIdentifierName();
 	auto predicate = "EXISTS (SELECT 1 FROM " + fallback_table + " openivm_aff WHERE " +
 	                 QualifiedColumn("openivm_aff", plan.partition_column) + " IS NOT DISTINCT FROM " +
 	                 QualifiedColumn(source_alias, spec.source_column) + ")";
@@ -802,10 +807,11 @@ static void BuildAliasedSourceLists(const vector<string> &cols, const vector<str
 static bool VisitQualifiedAlias(ParsedExpression &expression, const string &alias, const string *replacement) {
 	bool found = false;
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(expression, [&](ColumnRefExpression &column) {
-		if (column.column_names.size() >= 2 && StringUtil::CIEquals(column.column_names[0], alias)) {
+		auto &column_names = column.ColumnNamesMutable();
+		if (column_names.size() >= 2 && StringUtil::CIEquals(column_names[0].GetIdentifierName(), alias)) {
 			found = true;
 			if (replacement) {
-				column.column_names[0] = *replacement;
+				column_names[0] = Identifier(*replacement);
 			}
 		}
 	});

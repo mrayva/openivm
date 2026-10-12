@@ -19,12 +19,13 @@
 namespace duckdb {
 
 static uint64_t HashBinding(const ColumnBinding &binding) {
-	return std::hash<idx_t>()(binding.table_index) ^ (std::hash<idx_t>()(binding.column_index) * 0x9e3779b97f4a7c15ULL);
+	return std::hash<idx_t>()(binding.table_index.index) ^
+	       (std::hash<idx_t>()(binding.column_index.GetIndexUnsafe()) * 0x9e3779b97f4a7c15ULL);
 }
 
 static void CollectExpressionBindings(Expression &expression, std::vector<ColumnBinding> &bindings) {
-	if (expression.type == ExpressionType::BOUND_COLUMN_REF) {
-		bindings.push_back(expression.Cast<BoundColumnRefExpression>().binding);
+	if (expression.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+		bindings.push_back(expression.Cast<BoundColumnRefExpression>().Binding());
 	}
 	ExpressionIterator::EnumerateChildren(expression, [&](unique_ptr<Expression> &child) {
 		if (child) {
@@ -43,8 +44,8 @@ static void CollectOperatorExpressionBindings(LogicalOperator &op, std::vector<C
 		return;
 	}
 	auto &join = op.Cast<LogicalDependentJoin>();
-	if (join.join_condition) {
-		CollectExpressionBindings(*join.join_condition, bindings);
+	if (join.condition) {
+		CollectExpressionBindings(*join.condition, bindings);
 	}
 	for (auto &column : join.correlated_columns) {
 		bindings.push_back(column.binding);
@@ -72,22 +73,23 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		unique_ptr<LogicalAggregate> agg_ptr = unique_ptr_cast<LogicalOperator, LogicalAggregate>(std::move(plan));
 		{
-			const idx_t old_gr_idx = agg_ptr->group_index;
-			const idx_t new_gr_idx = binder.GenerateTableIndex();
-			agg_ptr->group_index = new_gr_idx;
+			const idx_t old_gr_idx = agg_ptr->group_index.index;
+			const idx_t new_gr_idx = binder.GenerateTableIndex().index;
+			agg_ptr->group_index = TableIndex(new_gr_idx);
 			table_reassign[old_gr_idx] = new_gr_idx;
 		}
 		{
-			const idx_t old_ag_idx = agg_ptr->aggregate_index;
-			const idx_t new_ag_idx = binder.GenerateTableIndex();
-			agg_ptr->aggregate_index = new_ag_idx;
+			const idx_t old_ag_idx = agg_ptr->aggregate_index.index;
+			const idx_t new_ag_idx = binder.GenerateTableIndex().index;
+			agg_ptr->aggregate_index = TableIndex(new_ag_idx);
 			table_reassign[old_ag_idx] = new_ag_idx;
 		}
 		{
-			const idx_t old_gs_idx = agg_ptr->groupings_index;
-			if (old_gs_idx != DConstants::INVALID_INDEX) {
-				const idx_t new_gs_idx = binder.GenerateTableIndex();
-				agg_ptr->groupings_index = new_gs_idx;
+			const auto old_gs_index = agg_ptr->groupings_index;
+			const idx_t old_gs_idx = old_gs_index.index;
+			if (old_gs_index.IsValid()) {
+				const idx_t new_gs_idx = binder.GenerateTableIndex().index;
+				agg_ptr->groupings_index = TableIndex(new_gs_idx);
 				table_reassign[old_gs_idx] = new_gs_idx;
 			}
 		}
@@ -99,9 +101,9 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		// Copy serializes DuckLake's bound scan but drops its SQL parameter cache.
 		// Restore it from the bound snapshot while already visiting copied scans.
 		PopulateDuckLakeChangeScanParameters(*get_ptr);
-		const idx_t current_idx = get_ptr->table_index;
-		const idx_t new_idx = binder.GenerateTableIndex();
-		get_ptr->table_index = new_idx;
+		const idx_t current_idx = get_ptr->table_index.index;
+		const idx_t new_idx = binder.GenerateTableIndex().index;
+		get_ptr->table_index = TableIndex(new_idx);
 		table_reassign[current_idx] = new_idx;
 #if OPENIVM_DEBUG
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_GET: Change %zu -> %zu\n", current_idx, new_idx);
@@ -111,9 +113,9 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 	}
 	case LogicalOperatorType::LOGICAL_DELIM_GET: {
 		unique_ptr<LogicalDelimGet> delim_get_ptr = unique_ptr_cast<LogicalOperator, LogicalDelimGet>(std::move(plan));
-		const idx_t current_idx = delim_get_ptr->table_index;
-		const idx_t new_idx = binder.GenerateTableIndex();
-		delim_get_ptr->table_index = new_idx;
+		const idx_t current_idx = delim_get_ptr->table_index.index;
+		const idx_t new_idx = binder.GenerateTableIndex().index;
+		delim_get_ptr->table_index = TableIndex(new_idx);
 		table_reassign[current_idx] = new_idx;
 #if OPENIVM_DEBUG
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_DELIM_GET: Change %zu -> %zu\n", current_idx, new_idx);
@@ -122,21 +124,21 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 	}
 	case LogicalOperatorType::LOGICAL_PROJECTION: {
 		unique_ptr<LogicalProjection> proj_ptr = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(plan));
-		const idx_t current_idx = proj_ptr->table_index;
-		const idx_t new_idx = binder.GenerateTableIndex();
+		const idx_t current_idx = proj_ptr->table_index.index;
+		const idx_t new_idx = binder.GenerateTableIndex().index;
 #if OPENIVM_DEBUG
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_PROJECTION: Change %zu -> %zu\n", current_idx, new_idx);
 #endif
-		proj_ptr->table_index = new_idx;
+		proj_ptr->table_index = TableIndex(new_idx);
 		table_reassign[current_idx] = new_idx;
 		proj_ptr->children = std::move(rec_children);
 		return {std::move(proj_ptr), table_reassign, current_bindings, contains_delim_operator};
 	}
 	case LogicalOperatorType::LOGICAL_UNNEST: {
 		auto &unnest = plan->Cast<LogicalUnnest>();
-		const idx_t current_idx = unnest.unnest_index;
-		const idx_t new_idx = binder.GenerateTableIndex();
-		unnest.unnest_index = new_idx;
+		const idx_t current_idx = unnest.unnest_index.index;
+		const idx_t new_idx = binder.GenerateTableIndex().index;
+		unnest.unnest_index = TableIndex(new_idx);
 		table_reassign[current_idx] = new_idx;
 #if OPENIVM_DEBUG
 		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_UNNEST: Change %zu -> %zu\n", current_idx, new_idx);
@@ -148,9 +150,9 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 	case LogicalOperatorType::LOGICAL_EXCEPT:
 	case LogicalOperatorType::LOGICAL_INTERSECT: {
 		auto &setop = plan->Cast<LogicalSetOperation>();
-		const idx_t current_idx = setop.table_index;
-		const idx_t new_idx = binder.GenerateTableIndex();
-		setop.table_index = new_idx;
+		const idx_t current_idx = setop.table_index.index;
+		const idx_t new_idx = binder.GenerateTableIndex().index;
+		setop.table_index = TableIndex(new_idx);
 		table_reassign[current_idx] = new_idx;
 		plan->children = std::move(rec_children);
 		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
@@ -164,19 +166,20 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder 
 		auto &empty = plan->Cast<LogicalEmptyResult>();
 		std::unordered_map<old_idx, new_idx> local_remap;
 		for (auto &cb : empty.bindings) {
-			auto it = local_remap.find(cb.table_index);
+			auto it = local_remap.find(cb.table_index.index);
 			idx_t new_t;
 			if (it == local_remap.end()) {
-				new_t = binder.GenerateTableIndex();
-				local_remap[cb.table_index] = new_t;
-				table_reassign[cb.table_index] = new_t;
+				new_t = binder.GenerateTableIndex().index;
+				local_remap[cb.table_index.index] = new_t;
+				table_reassign[cb.table_index.index] = new_t;
 #if OPENIVM_DEBUG
-				OPENIVM_DEBUG_PRINT("Index regen LOGICAL_EMPTY_RESULT: Change %zu -> %zu\n", cb.table_index, new_t);
+				OPENIVM_DEBUG_PRINT("Index regen LOGICAL_EMPTY_RESULT: Change %zu -> %zu\n", cb.table_index.index,
+				                    new_t);
 #endif
 			} else {
 				new_t = it->second;
 			}
-			cb.table_index = new_t;
+			cb.table_index = TableIndex(new_t);
 		}
 		plan->children = std::move(rec_children);
 		return {std::move(plan), table_reassign, current_bindings, contains_delim_operator};
@@ -201,13 +204,13 @@ static void RebindExpressionsNullSafe(LogicalOperator &op, ColumnBindingReplacer
 	});
 	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
 		auto &join = op.Cast<LogicalDependentJoin>();
-		if (join.join_condition) {
-			replacer.VisitExpression(&join.join_condition);
+		if (join.condition) {
+			replacer.VisitExpression(&join.condition);
 		}
 		for (auto &column : join.correlated_columns) {
-			auto entry = table_mapping.find(column.binding.table_index);
+			auto entry = table_mapping.find(column.binding.table_index.index);
 			if (entry != table_mapping.end()) {
-				column.binding.table_index = entry->second;
+				column.binding.table_index = TableIndex(entry->second);
 			}
 		}
 	}
@@ -223,15 +226,15 @@ ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings
 	ColumnBindingReplacer replacer;
 	std::unordered_set<uint64_t> seen;
 	for (const ColumnBinding &cb : bindings) {
-		if (table_mapping.find(cb.table_index) == table_mapping.end()) {
+		if (table_mapping.find(cb.table_index.index) == table_mapping.end()) {
 			continue;
 		}
 		uint64_t key = HashBinding(cb);
 		if (!seen.insert(key).second) {
 			continue;
 		}
-		new_idx new_t = table_mapping.at(cb.table_index);
-		replacer.replacement_bindings.emplace_back(cb, ColumnBinding(new_t, cb.column_index));
+		new_idx new_t = table_mapping.at(cb.table_index.index);
+		replacer.replacement_bindings.emplace_back(cb, ColumnBinding(TableIndex(new_t), cb.column_index));
 	}
 	return replacer;
 }

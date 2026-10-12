@@ -9,7 +9,7 @@ namespace duckdb {
 
 namespace {
 
-static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, const LogicalType &mul_type) {
+static void UpdateCteRefsWithMul(LogicalOperator *node, TableIndex cte_table_index, const LogicalType &mul_type) {
 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
 		auto &ref = node->Cast<LogicalCTERef>();
 		if (ref.cte_index == cte_table_index &&
@@ -32,7 +32,7 @@ DeltaPlanFragment CompileCteDelta(DeltaOperatorInput input) {
 		LogDeltaOperatorStrategy(input, DeltaOperatorStrategy::CTE_MATERIALIZED);
 		// CTE wrapper: children[0] = CTE definition, children[1] = consumer.
 		auto &cte = input.plan->Cast<LogicalCTE>();
-		idx_t cte_table_index = cte.table_index;
+		TableIndex cte_table_index = cte.table_index;
 
 		auto def_mul = input.CompileChild(input.plan->children[0], input.root);
 		input.plan->children[0] = std::move(def_mul.op);

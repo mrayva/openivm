@@ -32,16 +32,17 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 	OPENIVM_DEBUG_PRINT("\n---end of insert node output---\n");
 #endif
 
-	auto table = Catalog::GetEntry<TableCatalogEntry>(context, view_catalog_name, view_schema_name,
-	                                                  SqlUtils::DeltaName(view_name), OnEntryNotFound::THROW_EXCEPTION,
-	                                                  QueryErrorContext());
+	auto table = Catalog::GetEntry<TableCatalogEntry>(
+	    context, QualifiedName(Identifier(view_catalog_name), Identifier(view_schema_name),
+	                           Identifier(SqlUtils::DeltaName(view_name))),
+	    OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, binder.GenerateTableIndex());
 
 	Value value;
 	unique_ptr<BoundConstantExpression> exp;
 	for (size_t i = 0; i < plan->expressions.size(); i++) {
-		insert_node->expected_types.emplace_back(plan->expressions[i]->return_type);
-		value = Value(plan->expressions[i]->return_type);
+		insert_node->expected_types.emplace_back(plan->expressions[i]->GetReturnType());
+		value = Value(plan->expressions[i]->GetReturnType());
 		exp = make_uniq<BoundConstantExpression>(std::move(value));
 		insert_node->bound_defaults.emplace_back(std::move(exp));
 	}
@@ -124,13 +125,18 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		throw NotImplementedException("Plan contains single node, this is not supported");
 	}
 
-	auto output_names = PrepareOutputNames(optimized_plan.get(), planner.names);
+	vector<string> planner_names;
+	planner_names.reserve(planner.names.size());
+	for (auto &name : planner.names) {
+		planner_names.push_back(name.GetIdentifierName());
+	}
+	auto output_names = PrepareOutputNames(optimized_plan.get(), planner_names);
 	DeltaCompileAssumptions assumptions;
 	auto delta_model = BuildRefreshDeltaViewModel(input, con, view, optimized_plan.get(), output_names, &assumptions);
 	LogDeltaModelSummary(delta_model);
 
 	// Join delta compilation uses input.optimizer.binder, which may not have been advanced by the local optimizer.
-	while (input.optimizer.binder.GenerateTableIndex() <= delta_model.max_table_index) {
+	while (input.optimizer.binder.GenerateTableIndex().index <= delta_model.max_table_index) {
 	}
 
 	DeltaCompiler compiler(input, con, view, delta_model, assumptions);

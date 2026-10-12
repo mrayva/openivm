@@ -8,6 +8,9 @@ set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
 set(LPTS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/lpts")
+if(OPENIVM_DUCKLAKE_SOURCE_DIR)
+    include_directories(BEFORE "${OPENIVM_DUCKLAKE_SOURCE_DIR}/src/include")
+endif()
 include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/ducklake/src/include)
 
 set(EXTENSION_SOURCES

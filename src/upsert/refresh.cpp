@@ -119,6 +119,60 @@ private:
 	vector<RefreshProfileStep> steps;
 };
 
+class ScopedRefreshSessionSettings {
+public:
+	ScopedRefreshSessionSettings(ClientContext &context, Connection &connection) : connection(connection) {
+		Capture(context, "disabled_optimizers", disabled_optimizers);
+		Capture(context, "max_expression_depth", max_expression_depth);
+		Capture(context, "preserve_insertion_order", preserve_insertion_order);
+	}
+
+	~ScopedRefreshSessionSettings() {
+		Restore("preserve_insertion_order", preserve_insertion_order, false);
+		Restore("disabled_optimizers", disabled_optimizers, true);
+		Restore("max_expression_depth", max_expression_depth, false);
+	}
+
+	ScopedRefreshSessionSettings(const ScopedRefreshSessionSettings &) = delete;
+	ScopedRefreshSessionSettings &operator=(const ScopedRefreshSessionSettings &) = delete;
+
+private:
+	struct Snapshot {
+		Value value;
+		bool valid = false;
+	};
+
+	static void Capture(ClientContext &context, const string &name, Snapshot &snapshot) {
+		snapshot.valid = context.TryGetCurrentSetting(Identifier(name), snapshot.value) && !snapshot.value.IsNull();
+	}
+
+	void Restore(const string &name, const Snapshot &snapshot, bool quote_string) noexcept {
+		if (!snapshot.valid) {
+			return;
+		}
+		string value = snapshot.value.ToString();
+		if (quote_string) {
+			value = "'" + SqlUtils::EscapeValue(value) + "'";
+		}
+		try {
+			auto result = connection.Query("SET " + name + " = " + value);
+			if (result->HasError()) {
+				OPENIVM_DEBUG_PRINT("[REFRESH] Failed to restore setting %s: %s\n", name.c_str(),
+				                    result->GetError().c_str());
+			}
+		} catch (const std::exception &e) {
+			OPENIVM_DEBUG_PRINT("[REFRESH] Failed to restore setting %s: %s\n", name.c_str(), e.what());
+		} catch (...) {
+			OPENIVM_DEBUG_PRINT("[REFRESH] Failed to restore setting %s\n", name.c_str());
+		}
+	}
+
+	Connection &connection;
+	Snapshot disabled_optimizers;
+	Snapshot max_expression_depth;
+	Snapshot preserve_insertion_order;
+};
+
 static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadata, Connection &con,
                                 const string &view_catalog_name, const string &view_schema_name,
                                 const string &view_name, const string &attached_db_catalog_name,
@@ -127,6 +181,33 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 // User-facing "schema.name" for error messages; view_key is the internal storage key.
 static string DisplayViewName(RefreshMetadata &metadata, const string &view_schema_name, const string &view_key) {
 	return (view_schema_name.empty() ? string("main") : view_schema_name) + "." + metadata.GetViewSQLName(view_key);
+}
+
+static string SanitizeRefreshExecutionError(const string &error, const string &display_name) {
+	constexpr const char *INTERNAL_VIEW_MARKER = "__openivm_mv_";
+	auto marker_pos = error.find(INTERNAL_VIEW_MARKER);
+	if (marker_pos == string::npos) {
+		return error;
+	}
+	string sanitized = error;
+	// DuckDB's source context can include generated delta-table names; keep the cause, not that SQL excerpt.
+	auto query_context = sanitized.find("\n\nLINE ");
+	if (query_context != string::npos && marker_pos >= query_context) {
+		sanitized.resize(query_context);
+	}
+	for (auto pos = sanitized.find(INTERNAL_VIEW_MARKER); pos != string::npos;
+	     pos = sanitized.find(INTERNAL_VIEW_MARKER, pos + display_name.size())) {
+		auto end = pos;
+		while (end < sanitized.size()) {
+			char c = sanitized[end];
+			if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_')) {
+				break;
+			}
+			end++;
+		}
+		sanitized.replace(pos, end - pos, display_name);
+	}
+	return sanitized;
 }
 
 // Generate and execute refresh SQL for a single view while the caller owns the mutation gate.
@@ -163,6 +244,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 	Connection exec_con(*context.db.get());
 	TransactionalMVLockState::Get(*exec_con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	ScopedRefreshSessionSettings refresh_settings(context, exec_con);
 	RefreshMetadata::UseCatalog(context, exec_con, view_catalog_name);
 	bool tx_open = false;
 	try {
@@ -319,8 +401,9 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			// parallel refreshes). InternalException causes DuckDB to flag the whole
 			// database as invalidated, forcing a restart. We've already rolled back, so
 			// the DB is in a clean state; the next refresh attempt should succeed.
+			string execution_error = SanitizeRefreshExecutionError(result->GetError(), display_name);
 			throw Exception(ExceptionType::EXECUTOR,
-			                "IVM refresh of '" + display_name + "' failed: " + result->GetError());
+			                "IVM refresh of '" + display_name + "' failed: " + execution_error);
 		}
 		if (!after_hook.empty()) {
 			auto hook_result = exec_con.Query(after_hook);
@@ -552,7 +635,7 @@ static bool AfterHookNeedsStaging(Connection &con, const string &hook_sql, const
 			return true;
 		}
 		for (const auto &modified : prepared->GetStatementProperties().modified_databases) {
-			if (!StringUtil::CIEquals(modified.first, catalog)) {
+			if (!StringUtil::CIEquals(modified.first.GetIdentifierName(), catalog)) {
 				return true;
 			}
 		}
@@ -802,10 +885,10 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	                       attached_db_schema_name, nullptr, nullptr, nullptr, &conservative_activity, nullptr, &facts,
 	                       &metadata_con, nullptr, true, &deferred_cleanup);
 	TransactionalMVLockState::Get(context).DeferDeltaCleanup(std::move(deferred_cleanup));
-	// DEFAULT now() is transaction-stable. Stamp this invocation's emitted MV deltas
-	// explicitly, and use the same boundary for its metadata, so subsequent refreshes
-	// can distinguish them from deltas retained for other consumers.
-	auto timestamp = Value::TIMESTAMP(Timestamp::GetCurrentTimestamp()).ToSQLString() + "::TIMESTAMP";
+	// Match the UTC wall-clock representation used by persisted watermarks. SQL now()
+	// is transaction-stable, so emitted deltas and metadata share one boundary without
+	// inheriting the host process's local timezone.
+	string timestamp = openivm::UTC_NOW_SQL;
 	ParserOptions options = context.GetParserOptions();
 	options.extensions = nullptr;
 	Parser parser(options);
@@ -813,23 +896,27 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	string stamped;
 	for (auto &statement : parser.statements) {
 		if (statement->type == StatementType::INSERT_STATEMENT) {
-			auto &insert = statement->Cast<InsertStatement>();
-			if (StringUtil::CIEquals(insert.table, SqlUtils::DeltaName(view_name)) &&
-			    std::find(insert.columns.begin(), insert.columns.end(), openivm::TIMESTAMP_COL) ==
-			        insert.columns.end()) {
-				D_ASSERT(!insert.columns.empty());
-				insert.columns.push_back(openivm::TIMESTAMP_COL);
+				auto &insert = statement->Cast<InsertStatement>();
+				auto &insert_node = *insert.node;
+				auto timestamp_column_exists = std::any_of(
+				    insert_node.columns.begin(), insert_node.columns.end(), [](const Identifier &column) {
+					    return StringUtil::CIEquals(column.GetIdentifierName(), openivm::TIMESTAMP_COL);
+				    });
+				if (StringUtil::CIEquals(insert_node.qualified_name.Name().GetIdentifierName(),
+				                         SqlUtils::DeltaName(view_name)) && !timestamp_column_exists) {
+					D_ASSERT(!insert_node.columns.empty());
+					insert_node.columns.push_back(Identifier(openivm::TIMESTAMP_COL));
 				Parser select_parser(options);
 				select_parser.ParseQuery("SELECT openivm_rows.*, " + timestamp + " FROM (" +
-				                         insert.select_statement->ToString() + ") openivm_rows");
-				insert.select_statement =
+					                         insert_node.select_statement->ToString() + ") openivm_rows");
+					insert_node.select_statement =
 				    unique_ptr_cast<SQLStatement, SelectStatement>(std::move(select_parser.statements[0]));
 			}
 		}
 		auto sql = statement->ToString();
 		if (statement->type == StatementType::UPDATE_STATEMENT ||
 		    (statement->type == StatementType::INSERT_STATEMENT &&
-		     StringUtil::CIEquals(statement->Cast<InsertStatement>().table,
+			     StringUtil::CIEquals(statement->Cast<InsertStatement>().node->qualified_name.Name().GetIdentifierName(),
 		                          SqlUtils::DeltaName(PublishedViewName(view_name))))) {
 			sql = SqlUtils::ReplaceAllOccurrences(sql, openivm::UTC_NOW_SQL, timestamp);
 		}
@@ -873,8 +960,9 @@ static string RefreshQuery(ClientContext &context, const FunctionParameters &par
 		view_schema_name = StringValue::Get(parameters.values[1]);
 	} else {
 		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		view_catalog_name = default_entry.catalog;
-		view_schema_name = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+		view_catalog_name = default_entry.GetCatalog().GetIdentifierName();
+		view_schema_name = default_entry.GetSchema().empty() ? DEFAULT_SCHEMA
+		                                                    : default_entry.GetSchema().GetIdentifierName();
 	}
 	Connection metadata_con(*context.db);
 	RefreshMetadata::UseCatalog(context, metadata_con, view_catalog_name);

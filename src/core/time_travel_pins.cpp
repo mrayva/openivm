@@ -7,6 +7,7 @@
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
+#include "duckdb/parser/query_node/insert_query_node.hpp"
 #include "duckdb/parser/query_node/recursive_cte_node.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
 #include "duckdb/parser/query_node/set_operation_node.hpp"
@@ -43,8 +44,8 @@ static void VisitQueryNode(QueryNode &node, const RefVisitor &visitor);
 static void VisitExpression(ParsedExpression &expression, const RefVisitor &visitor) {
 	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
 		auto &subquery = expression.Cast<SubqueryExpression>();
-		if (subquery.subquery && subquery.subquery->node) {
-			VisitQueryNode(*subquery.subquery->node, visitor);
+		if (subquery.Subquery() && subquery.Subquery()->node) {
+			VisitQueryNode(*subquery.Subquery()->node, visitor);
 		}
 	}
 	ParsedExpressionIterator::EnumerateChildren(expression,
@@ -55,8 +56,9 @@ static void VisitTableRef(TableRef &ref, const RefVisitor &visitor) {
 	switch (ref.type) {
 	case TableReferenceType::BASE_TABLE: {
 		auto &base_table = ref.Cast<BaseTableRef>();
-		bool unqualified = base_table.catalog_name.empty() && base_table.schema_name.empty();
-		if (unqualified && visitor.cte_names.find(base_table.table_name) != visitor.cte_names.end()) {
+		auto &qualified_name = base_table.GetQualifiedName();
+		bool unqualified = qualified_name.Catalog().empty() && qualified_name.Schema().empty();
+		if (unqualified && visitor.cte_names.find(qualified_name.Name().GetIdentifierName()) != visitor.cte_names.end()) {
 			break;
 		}
 		visitor.callback(base_table);
@@ -105,10 +107,10 @@ static void VisitQueryNode(QueryNode &node, const RefVisitor &visitor) {
 	// Each CTE body sees preceding siblings, but not its own name.
 	RefVisitor scoped {visitor.callback, visitor.cte_names};
 	for (auto &cte : node.cte_map.map) {
-		if (cte.second->query && cte.second->query->node) {
-			VisitQueryNode(*cte.second->query->node, scoped);
+		if (cte.second->query_node) {
+			VisitQueryNode(*cte.second->query_node, scoped);
 		}
-		scoped.cte_names.insert(cte.first);
+		scoped.cte_names.insert(cte.first.GetIdentifierName());
 	}
 	switch (node.type) {
 	case QueryNodeType::SELECT_NODE: {
@@ -144,7 +146,7 @@ static void VisitQueryNode(QueryNode &node, const RefVisitor &visitor) {
 	case QueryNodeType::RECURSIVE_CTE_NODE: {
 		auto &recursive_cte = node.Cast<RecursiveCTENode>();
 		RefVisitor recursive_scope {visitor.callback, scoped.cte_names};
-		recursive_scope.cte_names.insert(recursive_cte.ctename);
+			recursive_scope.cte_names.insert(recursive_cte.ctename.GetIdentifierName());
 		if (recursive_cte.left) {
 			VisitQueryNode(*recursive_cte.left, recursive_scope);
 		}
@@ -160,7 +162,7 @@ static void VisitQueryNode(QueryNode &node, const RefVisitor &visitor) {
 		}
 		if (cte.child) {
 			RefVisitor child_scope {visitor.callback, scoped.cte_names};
-			child_scope.cte_names.insert(cte.ctename);
+			child_scope.cte_names.insert(cte.ctename.GetIdentifierName());
 			VisitQueryNode(*cte.child, child_scope);
 		}
 		break;
@@ -196,8 +198,8 @@ static void VisitStatement(SQLStatement &statement, const RefVisitor &visitor) {
 	}
 	case StatementType::INSERT_STATEMENT: {
 		auto &insert = statement.Cast<InsertStatement>();
-		if (insert.select_statement && insert.select_statement->node) {
-			VisitQueryNode(*insert.select_statement->node, visitor);
+		if (insert.node && insert.node->select_statement && insert.node->select_statement->node) {
+			VisitQueryNode(*insert.node->select_statement->node, visitor);
 		}
 		break;
 	}
@@ -209,12 +211,13 @@ static void VisitStatement(SQLStatement &statement, const RefVisitor &visitor) {
 // Resolve without the AT clause; DuckDB owns lookup errors for unresolved relations.
 static optional_ptr<CatalogEntry> LookupPinRelation(ClientContext &context, BaseTableRef &ref) {
 	QueryErrorContext error_context;
-	EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, ref.table_name, error_context);
 	try {
-		auto catalog = ref.catalog_name;
-		auto schema = ref.schema_name;
+		auto catalog = ref.GetQualifiedName().Catalog();
+		auto schema = ref.GetQualifiedName().Schema();
 		Binder::BindSchemaOrCatalog(context, catalog, schema);
-		return Catalog::GetEntry(context, catalog, schema, lookup, OnEntryNotFound::RETURN_NULL);
+		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
+		                       QualifiedName(catalog, schema, ref.GetQualifiedName().Name()), error_context);
+		return Catalog::GetEntry(context, lookup, OnEntryNotFound::RETURN_NULL);
 	} catch (const std::exception &) {
 		return nullptr;
 	}
@@ -241,34 +244,35 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 		if (!ref.at_clause) {
 			// Track native scans too: the pin map is keyed by relation name, so mixed pinned and
 			// unpinned uses of that name cannot be represented safely.
-			unpinned.insert(ref.table_name);
+			unpinned.insert(ref.Table().GetIdentifierName());
 			return;
 		}
 		Pin pin;
-		pin.catalog = ref.catalog_name;
-		pin.schema = ref.schema_name;
+		pin.catalog = ref.GetQualifiedName().Catalog().GetIdentifierName();
+		pin.schema = ref.GetQualifiedName().Schema().GetIdentifierName();
 		auto relation = LookupPinRelation(context, ref);
 		pin.binds_natively = !relation || relation->ParentCatalog().SupportsTimeTravel();
 		if (relation) {
-			pin.catalog = relation->ParentCatalog().GetName();
-			pin.schema = relation->ParentSchema().name;
+			pin.catalog = relation->ParentCatalog().GetName().GetIdentifierName();
+			pin.schema = relation->ParentSchema().name.GetIdentifierName();
 		}
 		// Binding loses the explicit AT clause even when it names the current native snapshot.
 		// Preserve it for LPTS, but only remove foreign pins from the locally executable query.
 		pin.snapshot = pin.binds_natively ? ref.at_clause->Copy() : std::move(ref.at_clause);
-		auto existing = result.pins.find(ref.table_name);
+		auto relation_name = ref.Table().GetIdentifierName();
+		auto existing = result.pins.find(relation_name);
 		if (existing != result.pins.end()) {
 			if (!AtClause::Equals(existing->second.snapshot, pin.snapshot)) {
-				ThrowAmbiguousPin(ref.table_name, "it is pinned to both '" + existing->second.snapshot->ToString() +
+				ThrowAmbiguousPin(relation_name, "it is pinned to both '" + existing->second.snapshot->ToString() +
 				                                      "' and '" + pin.snapshot->ToString() + "'");
 			}
 			if (existing->second.catalog != pin.catalog || existing->second.schema != pin.schema) {
-				ThrowAmbiguousPin(ref.table_name, "the same pin names two differently qualified relations");
+				ThrowAmbiguousPin(relation_name, "the same pin names two differently qualified relations");
 			}
 		}
 		OPENIVM_DEBUG_PRINT("[TIME TRAVEL] Recorded pin '%s' on relation '%s' (native=%d)\n",
-		                    pin.snapshot->ToString().c_str(), ref.table_name.c_str(), pin.binds_natively);
-		result.pins[ref.table_name] = std::move(pin);
+		                    pin.snapshot->ToString().c_str(), relation_name.c_str(), pin.binds_natively);
+		result.pins[relation_name] = std::move(pin);
 	};
 	RefVisitor visitor {callback, case_insensitive_set_t()};
 	VisitStatement(statement, visitor);
@@ -285,13 +289,14 @@ SnapshotResolver TimeTravelPins::Resolver() const {
 		return {};
 	}
 	return [this](const TableCatalogEntry &table) -> unique_ptr<AtClause> {
-		auto entry = pins.find(table.name);
+		auto entry = pins.find(table.name.GetIdentifierName());
 		if (entry == pins.end()) {
 			return nullptr;
 		}
 		auto &pin = entry->second;
-		if ((!pin.catalog.empty() && !StringUtil::CIEquals(pin.catalog, table.ParentCatalog().GetName())) ||
-		    (!pin.schema.empty() && !StringUtil::CIEquals(pin.schema, table.schema.name))) {
+		if ((!pin.catalog.empty() &&
+		     !StringUtil::CIEquals(pin.catalog, table.ParentCatalog().GetName().GetIdentifierName())) ||
+		    (!pin.schema.empty() && !StringUtil::CIEquals(pin.schema, table.schema.name.GetIdentifierName()))) {
 			return nullptr;
 		}
 		return pin.snapshot->Copy();
@@ -331,14 +336,14 @@ string TimeTravelPins::StripFrom(ClientContext &context, const string &sql) cons
 		throw InternalException("Expected one view query while stripping time-travel pins");
 	}
 	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
-		auto entry = pins.find(ref.table_name);
+		auto entry = pins.find(ref.Table().GetIdentifierName());
 		if (entry == pins.end() || entry->second.binds_natively) {
 			return;
 		}
 		auto &pin = entry->second;
 		auto relation = LookupPinRelation(context, ref);
-		if (relation && StringUtil::CIEquals(pin.catalog, relation->ParentCatalog().GetName()) &&
-		    StringUtil::CIEquals(pin.schema, relation->ParentSchema().name)) {
+		if (relation && StringUtil::CIEquals(pin.catalog, relation->ParentCatalog().GetName().GetIdentifierName()) &&
+		    StringUtil::CIEquals(pin.schema, relation->ParentSchema().name.GetIdentifierName())) {
 			ref.at_clause.reset();
 		}
 	};

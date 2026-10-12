@@ -18,19 +18,20 @@ struct DeltaJoinKeyProbe {
 };
 
 inline uint64_t DeltaJoinBindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
+	return (uint64_t)binding.table_index.index ^
+	       ((uint64_t)binding.column_index.GetIndexUnsafe() * 0x9e3779b97f4a7c15ULL);
 }
 
-inline bool TryGetDeltaJoinColumnRef(Expression &expr, ColumnBinding &binding) {
-	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
-		auto &cast = expr.Cast<BoundCastExpression>();
-		return TryGetDeltaJoinColumnRef(*cast.child, binding);
+inline bool TryGetDeltaJoinColumnRef(const Expression &expr, ColumnBinding &binding) {
+	if (BoundCastExpression::IsCast(expr)) {
+		auto &cast = expr.Cast<BoundFunctionExpression>();
+		return TryGetDeltaJoinColumnRef(BoundCastExpression::Child(cast), binding);
 	}
 	if (expr.GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
 		return false;
 	}
 	auto &col = expr.Cast<BoundColumnRefExpression>();
-	binding = col.binding;
+	binding = col.Binding();
 	return true;
 }
 
@@ -44,12 +45,12 @@ void CollectDeltaJoinKeyProbes(LogicalOperator *node, const unordered_map<uint64
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
 		if (join && join->join_type == JoinType::INNER) {
 			for (auto &cond : join->conditions) {
-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
+				if (!cond.IsComparison() || cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 					continue;
 				}
 				ColumnBinding left_binding, right_binding;
-				if (!TryGetDeltaJoinColumnRef(*cond.left, left_binding) ||
-				    !TryGetDeltaJoinColumnRef(*cond.right, right_binding)) {
+				if (!TryGetDeltaJoinColumnRef(cond.GetLHS(), left_binding) ||
+				    !TryGetDeltaJoinColumnRef(cond.GetRHS(), right_binding)) {
 					continue;
 				}
 				if (debug_label) {

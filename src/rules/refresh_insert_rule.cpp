@@ -21,10 +21,11 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_alter.hpp"
+#include "duckdb/planner/operator/logical_drop.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 
@@ -90,11 +91,11 @@ static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &t
 		return "";
 	}
 	string columns;
-	for (auto &name : rows.names) {
+	for (auto &name : rows.GetNames()) {
 		if (!columns.empty()) {
 			columns += ", ";
 		}
-		columns += SqlUtils::QuoteIdentifier(name);
+		columns += SqlUtils::QuoteIdentifier(name.GetIdentifierName());
 	}
 	string values;
 	for (idx_t row = 0; row < rows.RowCount(); row++) {
@@ -141,11 +142,9 @@ static void DropCatalogEntry(ClientContext &context, const string &catalog_name,
                              const string &entry_name, CatalogType type) {
 	DropInfo info;
 	info.type = type;
-	info.catalog = catalog_name;
-	info.schema = schema_name;
-	info.name = entry_name;
+	info.SetQualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(entry_name));
 	info.if_not_found = OnEntryNotFound::RETURN_NULL;
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::DROP_CATALOG_ENTRY);
 	catalog.DropEntry(context, info);
 }
@@ -168,10 +167,8 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
                                           const string &catalog_name, const string &schema_name,
                                           const string &delta_name) {
 	auto delta_alter = source_alter.Copy();
-	delta_alter->catalog = catalog_name;
-	delta_alter->schema = schema_name;
-	delta_alter->name = delta_name;
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
+	delta_alter->SetQualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(delta_name));
+	auto &catalog = Catalog::GetCatalog(context, Identifier(catalog_name));
 	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE);
 	catalog.Alter(context, *delta_alter);
 }
@@ -179,11 +176,14 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
 static pair<string, string> ResolveDDLLocus(ClientContext &context, const string &catalog_name,
                                             const string &schema_name) {
 	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	string default_catalog =
-	    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+	string default_catalog = default_entry.GetCatalog().empty()
+	                             ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
+	                             : default_entry.GetCatalog().GetIdentifierName();
 	return {
 	    catalog_name.empty() ? default_catalog : catalog_name,
-	    schema_name.empty() ? (default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema) : schema_name,
+	    schema_name.empty()
+	        ? (default_entry.GetSchema().empty() ? DEFAULT_SCHEMA : default_entry.GetSchema().GetIdentifierName())
+	        : schema_name,
 	};
 }
 
@@ -195,8 +195,12 @@ static bool SameRelationLocus(const string &left_catalog, const string &left_sch
 static string MVInternalPrefix(ClientContext &context, const RefreshMetadata::StoredViewLocation &location,
                                const string &view_name, const string &sql_name) {
 	QueryErrorContext error_context;
-	auto entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
-	                               EntryLookupInfo(CatalogType::VIEW_ENTRY, sql_name, error_context),
+	auto entry = Catalog::GetEntry(
+	    context,
+	    EntryLookupInfo(CatalogType::VIEW_ENTRY,
+	                    QualifiedName(Identifier(location.catalog_name), Identifier(location.schema_name),
+	                                  Identifier(sql_name)),
+	                    error_context),
 	                               OnEntryNotFound::RETURN_NULL);
 	if (entry) {
 		auto data_table = IncrementalTableNames::DataTableName(view_name);
@@ -261,14 +265,14 @@ static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
 }
 
 static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &context, TableCatalogEntry &table) {
-	const auto &table_name = table.name;
+	const auto &table_name = table.name.GetIdentifierName();
 	if (table_name.empty() || SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
 	    table.catalog.GetCatalogType() == "ducklake") {
 		return nullptr;
 	}
-	auto delta_table =
-	    Catalog::GetEntry<TableCatalogEntry>(context, table.catalog.GetName(), table.schema.name,
-	                                         SqlUtils::DeltaName(table_name), OnEntryNotFound::RETURN_NULL);
+	auto delta_table = Catalog::GetEntry<TableCatalogEntry>(
+	    context, QualifiedName(table.catalog.GetName(), table.schema.name, Identifier(SqlUtils::DeltaName(table_name))),
+	    OnEntryNotFound::RETURN_NULL);
 	if (!delta_table) {
 		return nullptr;
 	}
@@ -300,13 +304,13 @@ static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert 
 }
 
 static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression &expression) {
-	if (expression.type != ExpressionType::BOUND_COLUMN_REF) {
+	if (expression.GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 		throw InternalException("OpenIVM expected a bound row-id column reference");
 	}
 	auto &column_ref = expression.Cast<BoundColumnRefExpression>();
 	auto bindings = child.GetColumnBindings();
 	for (idx_t index = 0; index < bindings.size(); index++) {
-		if (bindings[index] == column_ref.binding) {
+		if (bindings[index] == column_ref.Binding()) {
 			return index;
 		}
 	}
@@ -316,7 +320,7 @@ static idx_t FindExpressionBindingIndex(LogicalOperator &child, const Expression
 static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate &update) {
 	bool has_default = false;
 	for (auto &expression : update.expressions) {
-		has_default = has_default || expression->type == ExpressionType::VALUE_DEFAULT;
+		has_default = has_default || expression->GetExpressionType() == ExpressionType::VALUE_DEFAULT;
 	}
 	if (!has_default) {
 		return;
@@ -338,7 +342,7 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 
 	vector<idx_t> default_indexes(update.expressions.size(), DConstants::INVALID_INDEX);
 	for (idx_t index = 0; index < update.expressions.size(); index++) {
-		if (update.expressions[index]->type != ExpressionType::VALUE_DEFAULT) {
+		if (update.expressions[index]->GetExpressionType() != ExpressionType::VALUE_DEFAULT) {
 			continue;
 		}
 		default_indexes[index] = projection_expressions.size();
@@ -348,7 +352,7 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 	const auto row_id_output_index = projection_expressions.size();
 	projection_expressions.push_back(make_uniq<BoundColumnRefExpression>(child_types.back(), child_bindings.back()));
 	for (idx_t index = 0; index < update.expressions.size(); index++) {
-		auto return_type = update.expressions[index]->return_type;
+		auto return_type = update.expressions[index]->GetReturnType();
 		idx_t output_index;
 		if (default_indexes[index] != DConstants::INVALID_INDEX) {
 			output_index = default_indexes[index];
@@ -357,7 +361,7 @@ static void ResolveUpdateDefaults(OptimizerExtensionInput &input, LogicalUpdate 
 			D_ASSERT(output_index + 1 < child_bindings.size());
 		}
 		update.expressions[index] =
-		    make_uniq<BoundColumnRefExpression>(return_type, ColumnBinding(projection_index, output_index));
+		    make_uniq<BoundColumnRefExpression>(return_type, ColumnBinding(projection_index, ProjectionIndex(output_index)));
 	}
 
 	auto projection = make_uniq<LogicalProjection>(projection_index, std::move(projection_expressions));
@@ -377,17 +381,15 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 	// Handle DROP TABLE/VIEW: clean up IVM metadata if the dropped object is an IVM view
 	if (root->type == LogicalOperatorType::LOGICAL_DROP) {
-		auto *simple = dynamic_cast<LogicalSimple *>(root);
-		if (!simple) {
-			return;
-		}
-		auto *drop_info = dynamic_cast<DropInfo *>(simple->info.get());
+		auto *drop_info = root->Cast<LogicalDrop>().info.get();
 		if (!drop_info || (drop_info->type != CatalogType::TABLE_ENTRY && drop_info->type != CatalogType::VIEW_ENTRY)) {
 			return;
 		}
 
-		auto table_name = drop_info->name;
-		auto target_locus = ResolveDDLLocus(input.context, drop_info->catalog, drop_info->schema);
+		auto &drop_name = drop_info->GetQualifiedName();
+		auto table_name = drop_name.Name().GetIdentifierName();
+		auto target_locus = ResolveDDLLocus(input.context, drop_name.Catalog().GetIdentifierName(),
+		                                  drop_name.Schema().GetIdentifierName());
 		Connection con(*input.context.db);
 		RefreshMetadata::UseCatalog(input.context, con, target_locus.first);
 
@@ -440,30 +442,28 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 
 	// Handle ALTER TABLE: sync delta table schema or block if referenced column is affected
 	if (root->type == LogicalOperatorType::LOGICAL_ALTER) {
-		auto *simple = dynamic_cast<LogicalSimple *>(root);
-		if (!simple) {
-			return;
-		}
-		auto *alter_info = dynamic_cast<AlterTableInfo *>(simple->info.get());
+		auto *alter_info = dynamic_cast<AlterTableInfo *>(root->Cast<LogicalAlter>().info.get());
 		if (!alter_info) {
 			return;
 		}
 
-		auto source = Catalog::GetEntry<TableCatalogEntry>(input.context, alter_info->catalog, alter_info->schema,
-		                                                   alter_info->name, OnEntryNotFound::RETURN_NULL);
+		auto source = Catalog::GetEntry<TableCatalogEntry>(input.context, alter_info->GetQualifiedName(),
+		                                                   OnEntryNotFound::RETURN_NULL);
 		if (!source) {
 			return;
 		}
 		// SQL identifiers are case-insensitive; metadata stores the catalog spelling.
-		string table_name = source->name;
+		string table_name = source->name.GetIdentifierName();
 		string delta_name = SqlUtils::DeltaName(table_name);
-		auto source_locus = std::make_pair(source->ParentCatalog().GetName(), source->schema.name);
+		auto source_locus = std::make_pair(source->ParentCatalog().GetName().GetIdentifierName(),
+		                                   source->schema.name.GetIdentifierName());
 
 		// Resolve only the source's delta table in the caller transaction. Scanning
 		// information_schema touches unrelated external catalogs and can silently
 		// skip schema synchronization when one of them is unavailable.
-		auto delta_entry = Catalog::GetEntry<TableCatalogEntry>(input.context, source_locus.first, source_locus.second,
-		                                                        delta_name, OnEntryNotFound::RETURN_NULL);
+		auto delta_entry = Catalog::GetEntry<TableCatalogEntry>(
+		    input.context, QualifiedName(Identifier(source_locus.first), Identifier(source_locus.second), Identifier(delta_name)),
+		    OnEntryNotFound::RETURN_NULL);
 		if (!delta_entry) {
 			return; // not an IVM-tracked table
 		}
@@ -478,7 +478,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				break;
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE ADD COLUMN '%s' — syncing delta table\n",
-			                    add_info->new_column.Name().c_str());
+			                    add_info->new_column.Name().GetIdentifierName().c_str());
 			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
 			                              delta_name);
 			break;
@@ -488,7 +488,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			if (!remove_info) {
 				break;
 			}
-			string col_name = remove_info->removed_column;
+			string col_name = remove_info->removed_column.GetIdentifierName();
 			for (auto &catalog : RefreshMetadata::MetadataCatalogs(con)) {
 				RefreshMetadata::UseCatalog(input.context, con, catalog);
 				auto referencing_mv = FirstMVReferencingColumn(con, delta_name, source_locus.first, source_locus.second,
@@ -509,8 +509,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			if (!rename_info) {
 				break;
 			}
-			string old_name = rename_info->old_name;
-			string new_name = rename_info->new_name;
+			string old_name = rename_info->old_name.GetIdentifierName();
+			string new_name = rename_info->new_name.GetIdentifierName();
 			auto dependent_view_predicate =
 			    "view_name IN (SELECT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 			    RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second) + ")";

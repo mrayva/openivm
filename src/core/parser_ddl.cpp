@@ -12,6 +12,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include <chrono>
 #include <cctype>
@@ -364,7 +365,7 @@ DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta
 	}
 
 	columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
-	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
+	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT " + string(openivm::UTC_NOW_SQL));
 	DeltaSchemaDDL result;
 	result.sql = string(replace ? "create or replace table " : "create table if not exists ") + delta_table + " (" +
 	             StringUtil::Join(columns, ", ") + ")";
@@ -556,7 +557,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 }
 
 unique_ptr<FunctionData> DDLExecutorBindFunction(ClientContext &context, TableFunctionBindInput &input,
-                                                 vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto bind_data = make_uniq<DDLExecutorBindData>(true);
 	for (auto &param : input.inputs) {
 		auto q = param.GetValue<string>();
@@ -599,7 +600,7 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 	// microsecond before it so rows inserted into a newly created MV delta
 	// table during this same transaction satisfy the compiler's strict `>`
 	// watermark predicate.
-	transaction_timestamp -= 1;
+	transaction_timestamp.value -= 1;
 	auto timestamp_sql = Value::TIMESTAMP(transaction_timestamp).ToSQLString() + "::TIMESTAMP";
 	for (auto &parameter : parameters) {
 		auto statement = parameter.GetValue<string>();
@@ -814,15 +815,19 @@ string BuildCreateDeltaFromDataOperation(const string &delta_table, const string
 }
 
 string BuildDropViewStatement(const DropInfo &drop_info) {
-	return "SELECT * FROM openivm_execute_drop_view('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
-	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
+	auto &name = drop_info.GetQualifiedName();
+	return "SELECT * FROM openivm_execute_drop_view('" + SqlUtils::EscapeValue(name.Catalog().GetIdentifierName()) + "', '" +
+	       SqlUtils::EscapeValue(name.Schema().GetIdentifierName()) + "', '" +
+	       SqlUtils::EscapeValue(name.Name().GetIdentifierName()) + "', " +
 	       (drop_info.cascade ? "true" : "false") + ", " +
 	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
 }
 
 string BuildDropTableStatement(const DropInfo &drop_info) {
-	return "SELECT * FROM openivm_execute_drop_table('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
-	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
+	auto &name = drop_info.GetQualifiedName();
+	return "SELECT * FROM openivm_execute_drop_table('" + SqlUtils::EscapeValue(name.Catalog().GetIdentifierName()) + "', '" +
+	       SqlUtils::EscapeValue(name.Schema().GetIdentifierName()) + "', '" +
+	       SqlUtils::EscapeValue(name.Name().GetIdentifierName()) + "', " +
 	       (drop_info.cascade ? "true" : "false") + ", " +
 	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
 }
@@ -836,23 +841,23 @@ struct DropViewGlobalState : public GlobalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> BindDropEntry(ClientContext &context, TableFunctionBindInput &input,
-                                              vector<LogicalType> &return_types, vector<string> &names,
+                                              vector<LogicalType> &return_types, vector<Identifier> &names,
                                               CatalogType type) {
 	if (input.inputs.size() != 5) {
 		throw InternalException("OpenIVM DROP executor expected five arguments");
 	}
 	auto result = make_uniq<DropViewBindData>();
 	result->info.type = type;
-	result->info.catalog = StringValue::Get(input.inputs[0]);
-	result->info.schema = StringValue::Get(input.inputs[1]);
-	result->info.name = StringValue::Get(input.inputs[2]);
+	result->info.SetQualifiedName(Identifier(StringValue::Get(input.inputs[0])),
+	                              Identifier(StringValue::Get(input.inputs[1])),
+	                              Identifier(StringValue::Get(input.inputs[2])));
 	result->info.cascade = BooleanValue::Get(input.inputs[3]);
 	result->info.if_not_found =
 	    BooleanValue::Get(input.inputs[4]) ? OnEntryNotFound::RETURN_NULL : OnEntryNotFound::THROW_EXCEPTION;
 	if (!input.binder) {
 		throw InternalException("OpenIVM DROP executor requires a binder");
 	}
-	auto &catalog = Catalog::GetCatalog(context, result->info.catalog);
+	auto &catalog = Catalog::GetCatalog(context, result->info.GetQualifiedName().Catalog());
 	input.binder->GetStatementProperties().RegisterDBModify(catalog, context,
 	                                                        DatabaseModificationType::DROP_CATALOG_ENTRY);
 	return_types.push_back(LogicalType::BOOLEAN);
@@ -861,12 +866,12 @@ static unique_ptr<FunctionData> BindDropEntry(ClientContext &context, TableFunct
 }
 
 unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+                                      vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return BindDropEntry(context, input, return_types, names, CatalogType::VIEW_ENTRY);
 }
 
 unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+                                       vector<LogicalType> &return_types, vector<Identifier> &names) {
 	return BindDropEntry(context, input, return_types, names, CatalogType::TABLE_ENTRY);
 }
 
@@ -880,7 +885,7 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 		return;
 	}
 	auto &bind_data = input.bind_data->Cast<DropViewBindData>();
-	auto &catalog = Catalog::GetCatalog(context, bind_data.info.catalog);
+	auto &catalog = Catalog::GetCatalog(context, bind_data.info.GetQualifiedName().Catalog());
 	DropInfo info(bind_data.info);
 	catalog.DropEntry(context, info);
 	output.SetValue(0, 0, Value::BOOLEAN(true));
@@ -977,12 +982,13 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			}
 			append_statement(string(replace ? "CREATE OR REPLACE TABLE " : "CREATE TABLE ") + delta_table +
 			                 " AS SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) +
-			                 ", now()::TIMESTAMP AS " + string(openivm::TIMESTAMP_COL) + " FROM " + data_table +
+			                 ", " + string(openivm::UTC_NOW_SQL) + " AS " + string(openivm::TIMESTAMP_COL) +
+			                 " FROM " + data_table +
 			                 " LIMIT 0");
 			append_statement(
 			    "ALTER TABLE " + delta_table + " ALTER " + string(openivm::MULTIPLICITY_COL) + " SET DEFAULT 1", false);
 			append_statement("ALTER TABLE " + delta_table + " ALTER " + string(openivm::TIMESTAMP_COL) +
-			                     " SET DEFAULT now()",
+			                     " SET DEFAULT " + string(openivm::UTC_NOW_SQL),
 			                 false);
 			continue;
 		}

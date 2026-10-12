@@ -299,7 +299,7 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 		auto &get = op.Cast<LogicalGet>();
 		if (get.GetTable().get() != nullptr) {
 			TableStats ts;
-			ts.table_name = get.GetTable()->name;
+			ts.table_name = get.GetTable()->name.GetIdentifierName();
 			ts.base_card = static_cast<double>(get.EstimateCardinality(context));
 			if (ts.base_card == 0) {
 				ts.base_card = 1;
@@ -315,8 +315,8 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
 
 			// DuckLake vs standard delta cardinality
 			if (get.function.name == "ducklake_scan" && get.function.function_info) {
-				string cat_name = get.GetTable()->ParentCatalog().GetName();
-				string schema_name = get.GetTable()->schema.name;
+				string cat_name = get.GetTable()->ParentCatalog().GetName().GetIdentifierName();
+				string schema_name = get.GetTable()->schema.name.GetIdentifierName();
 				ts.delta_table_name = ts.table_name; // DuckLake stores bare name
 				ts.delta_card =
 				    GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name, delta_activity);
@@ -905,7 +905,8 @@ string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters 
 	       " AS view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
 	       " FROM " +
-	       SqlUtils::FullName(ClientData::Get(*con.context).catalog_search_path->GetDefault().catalog, DEFAULT_SCHEMA,
+	       SqlUtils::FullName(
+	           ClientData::Get(*con.context).catalog_search_path->GetDefault().GetCatalog().GetIdentifierName(), DEFAULT_SCHEMA,
 	                          openivm::HISTORY_TABLE) +
 	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }

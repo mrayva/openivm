@@ -40,14 +40,13 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	// Group-by keys = all child columns EXCEPT multiplicity
 	// Aggregate = COUNT(*) as openivm_distinct_count
 	// Multiplicity is added as a group-by key (same pattern as aggregate delta)
-	idx_t group_index = binder.GenerateTableIndex();
-	idx_t aggregate_index = binder.GenerateTableIndex();
+	TableIndex group_index = binder.GenerateTableIndex();
+	TableIndex aggregate_index = binder.GenerateTableIndex();
 
 	auto count_star_func = CountStarFun::GetFunction();
 	vector<unique_ptr<Expression>> count_args;
-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
-	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = openivm::DISTINCT_COUNT_COL;
+	auto count_expr = count_star_func.Bind(input.context.input.context, std::move(count_args));
+	count_expr->SetAlias(Identifier(openivm::DISTINCT_COUNT_COL));
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(std::move(count_expr));
@@ -63,17 +62,17 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 			continue; // skip multiplicity — added separately below
 		}
 		auto group_expr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
-		grouping_set.insert(agg_node->groups.size());
+		grouping_set.insert(ProjectionIndex(agg_node->groups.size()));
 		agg_node->groups.push_back(std::move(group_expr));
 		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
 	}
 
 	ColumnBinding mod_mul_binding;
-	mod_mul_binding.column_index = agg_node->groups.size();
+	mod_mul_binding.column_index = ProjectionIndex(agg_node->groups.size());
 	mod_mul_binding.table_index = group_index;
 
 	auto mul_expr = make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, input.mul_type, input_mul_binding);
-	grouping_set.insert(agg_node->groups.size());
+	grouping_set.insert(ProjectionIndex(agg_node->groups.size()));
 	agg_node->groups.push_back(std::move(mul_expr));
 	agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input.mul_type)));
 
@@ -100,7 +99,7 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 		if (child_bindings[i] == input_mul_binding) {
 			continue; // multiplicity is not in the parent's original bindings
 		}
-		ColumnBinding new_binding(group_index, group_position);
+		ColumnBinding new_binding(group_index, ProjectionIndex(group_position));
 		replacer.replacement_bindings.emplace_back(original_bindings[original_position], new_binding);
 		original_position++;
 		group_position++;
@@ -114,8 +113,8 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 
 	OPENIVM_DEBUG_PRINT("[DeltaDistinct] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
 	                    "table=%lu col=%lu\n",
-	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index,
-	                    (unsigned long)mod_mul_binding.column_index);
+	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index.index,
+	                    (unsigned long)mod_mul_binding.column_index.GetIndexUnsafe());
 
 	return {std::move(agg_node), mod_mul_binding};
 }

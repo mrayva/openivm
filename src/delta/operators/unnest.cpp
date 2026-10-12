@@ -40,8 +40,8 @@ static void PreserveMultiplicityInProjectionMaps(LogicalOperator &op, const Colu
 			}
 			// INVALID_INDEX is a sentinel, never a projection index.
 			if (mul_idx != DConstants::INVALID_INDEX && // mull-ignore: cxx_ne_to_eq
-			    std::find(projection_map.begin(), projection_map.end(), mul_idx) == projection_map.end()) {
-				projection_map.push_back(mul_idx);
+			    std::find(projection_map.begin(), projection_map.end(), ProjectionIndex(mul_idx)) == projection_map.end()) {
+				projection_map.push_back(ProjectionIndex(mul_idx));
 				OPENIVM_DEBUG_PRINT("[DeltaUnnest] Added mul col %lu to %s projection map\n", (unsigned long)mul_idx,
 				                    child_idx == 0 ? "left" : "right");
 				join.ResolveOperatorTypes();
@@ -80,7 +80,7 @@ DeltaPlanFragment CompileUnnestDelta(DeltaOperatorInput input) {
 		}
 		projection_exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[i], output_bindings[i]));
 		replacer.replacement_bindings.emplace_back(original_bindings[visible_output_idx],
-		                                           ColumnBinding(projection_index, visible_output_idx));
+		                                           ColumnBinding(projection_index, ProjectionIndex(visible_output_idx)));
 		visible_output_idx++;
 	}
 	if (visible_output_idx != original_bindings.size()) {

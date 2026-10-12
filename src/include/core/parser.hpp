@@ -38,7 +38,7 @@ public:
 		parser_info = make_shared_ptr<MaterializedViewParserExtensionInfo>();
 	}
 
-	static ParserExtensionParseResult ParseFunction(ParserExtensionInfo *info, const string &query);
+	static ParserExtensionParseResult ParseFunction(ParserExtensionInfo *info, const vector<SimpleToken> &tokens);
 	static ParserOverrideResult OverrideFunction(ParserExtensionInfo *info, const string &query,
 	                                             ParserOptions &options);
 	static ParserExtensionPlanResult PlanFunction(ParserExtensionInfo *info, ClientContext &context,

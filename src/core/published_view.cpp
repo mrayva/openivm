@@ -19,9 +19,10 @@ bool IsSnapshotPublication(ClientContext &context, const string &catalog, const 
                            const string &view_name) {
 	bool snapshot_publication = false;
 	auto lookup = [&]() {
-		auto entry = Catalog::GetEntry(context, catalog, schema,
-		                               EntryLookupInfo(CatalogType::VIEW_ENTRY, PublishedViewName(view_name)),
-		                               OnEntryNotFound::RETURN_NULL);
+		EntryLookupInfo lookup_info(
+		    CatalogType::VIEW_ENTRY,
+		    QualifiedName(Identifier(catalog), Identifier(schema), Identifier(PublishedViewName(view_name))));
+		auto entry = Catalog::GetEntry(context, lookup_info, OnEntryNotFound::RETURN_NULL);
 		snapshot_publication = entry && entry->type == CatalogType::VIEW_ENTRY;
 	};
 	if (context.transaction.HasActiveTransaction()) {

@@ -248,11 +248,11 @@ static SemiAntiSourceInput ResolveSemiAntiSourceInput(RefreshMetadata &metadata,
 static void CopyOpenIvmSetting(ClientContext &from, ClientContext &to, const string &name) {
 	auto &db_config = DBConfig::GetConfig(to);
 	ExtensionOption option;
-	if (!db_config.TryGetExtensionOption(name, option) || !option.setting_index.IsValid()) {
+	if (!db_config.TryGetExtensionOption(Identifier(name), option) || !option.setting_index.IsValid()) {
 		return;
 	}
 	Value value;
-	if (from.TryGetCurrentSetting(name, value) && !value.IsNull()) {
+	if (from.TryGetCurrentSetting(Identifier(name), value) && !value.IsNull()) {
 		to.config.user_settings.SetUserSetting(option.setting_index.GetIndex(), value);
 	} else {
 		to.config.user_settings.ClearSetting(option.setting_index.GetIndex());
@@ -505,11 +505,16 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	if (internal_catalog_prefix.empty() || internal_catalog_name == default_db) {
 		con.BeginTransaction();
 		delta_view_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    planning_context, internal_catalog_name, internal_schema_name, SqlUtils::DeltaName(view_name),
+		    planning_context,
+		    QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+		                  Identifier(SqlUtils::DeltaName(view_name))),
 		    OnEntryNotFound::THROW_EXCEPTION, error_context);
 		index_delta_view_catalog_entry = Catalog::GetEntry(
-		    planning_context, internal_catalog_name, internal_schema_name,
-		    EntryLookupInfo(CatalogType::INDEX_ENTRY, data_table_bare + openivm::INDEX_SUFFIX, error_context),
+		    planning_context,
+		    EntryLookupInfo(CatalogType::INDEX_ENTRY,
+		                    QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+		                                  Identifier(data_table_bare + openivm::INDEX_SUFFIX)),
+		                    error_context),
 		    OnEntryNotFound::RETURN_NULL);
 		con.Rollback();
 	}
@@ -558,9 +563,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			    metadata.GetTableColumns(internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
 		} else {
 			auto &published_entry = Catalog::GetEntry<TableCatalogEntry>(
-			    context, internal_catalog_name, internal_schema_name, PublishedViewName(view_name));
+			    context, QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                           Identifier(PublishedViewName(view_name))));
 			for (auto &column : published_entry.GetColumns().Logical()) {
-				publication_columns.push_back(column.Name());
+				publication_columns.push_back(column.Name().GetIdentifierName());
 			}
 		}
 		publication_query = publication->GetValue(0, 0).ToString();
@@ -572,7 +578,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		    node->type != QueryNodeType::SELECT_NODE || bool(node->Cast<SelectNode>().where_clause);
 		for (auto &modifier : node->modifiers) {
 			global_publication |= modifier->type == ResultModifierType::LIMIT_MODIFIER ||
-			                      modifier->type == ResultModifierType::LIMIT_PERCENT_MODIFIER ||
+			                      modifier->type == ResultModifierType::LEGACY_LIMIT_PERCENT_MODIFIER ||
 			                      modifier->type == ResultModifierType::ORDER_MODIFIER;
 		}
 
@@ -797,8 +803,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// Global column enumeration binds every snapshot publication view. Read only
 		// this delta table and copy its schema while the catalog transaction is live.
 		con.context->RunFunctionInTransaction([&]() {
-			auto &entry = Catalog::GetEntry<TableCatalogEntry>(*con.context, internal_catalog_name,
-			                                                   internal_schema_name, SqlUtils::DeltaName(view_name));
+			auto &entry = Catalog::GetEntry<TableCatalogEntry>(
+			    *con.context,
+			    QualifiedName(Identifier(internal_catalog_name), Identifier(internal_schema_name),
+			                  Identifier(SqlUtils::DeltaName(view_name))));
 			read_delta_columns(entry);
 		});
 	}
