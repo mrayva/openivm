@@ -32,10 +32,11 @@ void IncrementalRewriteRule::AddInsertNode(ClientContext &context, Binder &binde
 	OPENIVM_DEBUG_PRINT("\n---end of insert node output---\n");
 #endif
 
-	auto table = Catalog::GetEntry<TableCatalogEntry>(
-	    context, QualifiedName(Identifier(view_catalog_name), Identifier(view_schema_name),
-	                           Identifier(SqlUtils::DeltaName(view_name))),
-	    OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
+	auto table =
+	    GetCatalogEntry<TableCatalogEntry>(context,
+	                                       QualifiedName(Identifier(view_catalog_name), Identifier(view_schema_name),
+	                                                     Identifier(SqlUtils::DeltaName(view_name))),
+	                                       OnEntryNotFound::THROW_EXCEPTION, QueryErrorContext());
 	auto insert_node = make_uniq<LogicalInsert>(*table, binder.GenerateTableIndex());
 
 	Value value;
@@ -84,8 +85,8 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		RefreshMetadata(con).SnapshotTransaction(input.context);
 	}
 
-	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
-	                   SqlUtils::EscapeValue(view) + "';");
+	auto v = MatQuery(con, "select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
+	                           SqlUtils::EscapeValue(view) + "';");
 	if (v->HasError()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: cannot read view definition for '" + view + "': " + v->GetError());
@@ -95,7 +96,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	}
 	string view_query = v->GetValue(0, 0).ToString();
 
-	Parser parser;
+	Parser parser(input.context);
 	Planner planner(input.context);
 
 	parser.ParseQuery(view_query);
@@ -105,7 +106,7 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	openivm::TimeTravelPins::Peel(input.context, *parser.statements[0]);
 
 	OPENIVM_DEBUG_PRINT("[REWRITE] About to CreatePlan for view query\n");
-	planner.CreatePlan(std::move(parser.statements[0]));
+	PlanWithSourceColumns(planner, std::move(parser.statements[0]));
 	OPENIVM_DEBUG_PRINT("[REWRITE] CreatePlan done\n");
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("Unoptimized plan: \n%s\n", planner.plan->ToString().c_str());

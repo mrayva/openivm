@@ -125,9 +125,9 @@ static bool ParseRunningWindowExpression(const ParsedExpression &expression, Run
 	out.rows_frame = window.WindowEnd() == WindowBoundary::CURRENT_ROW_ROWS;
 	out.nulls_first = window.OrderBy()[0].null_order == OrderByNullType::NULLS_FIRST;
 	const auto &arguments = window.GetArguments();
-	out.argument = arguments.empty() && (function == "count" || function == "row_number")
-	                   ? "*"
-	                   : arguments.empty() ? "" : RunningColumn(arguments[0].GetExpression());
+	out.argument = arguments.empty() && (function == "count" || function == "row_number") ? "*"
+	               : arguments.empty()                                                    ? ""
+	                                   : RunningColumn(arguments[0].GetExpression());
 	out.output_column = expression.GetName().GetIdentifierName();
 	partition_col = partition;
 	order_col = order;
@@ -135,7 +135,7 @@ static bool ParseRunningWindowExpression(const ParsedExpression &expression, Run
 }
 
 static unique_ptr<SelectStatement> ParseRunningSelect(const string &sql) {
-	Parser parser;
+	Parser parser(ParserOptions::Builtin());
 	try {
 		parser.ParseQuery(sql);
 	} catch (const ParserException &) {
@@ -212,7 +212,7 @@ static bool TryParseRunningWindowPlan(SelectNode &select, const vector<string> &
 	for (auto &column : column_names) {
 		bool found = false;
 		for (auto &item : select.select_list) {
-		found = found || StringUtil::CIEquals(column, item->GetName().GetIdentifierName());
+			found = found || StringUtil::CIEquals(column, item->GetName().GetIdentifierName());
 		}
 		if (!found) {
 			return false;
@@ -269,7 +269,7 @@ static bool TryParseLptsRunningWindowPlan(SelectNode &select, const vector<strin
 			return false;
 		}
 		for (idx_t i = 0; i < body->select_list.size(); i++) {
-		auto target = final_names.find(StringUtil::Lower((*it)->aliases[i].GetIdentifierName()));
+			auto target = final_names.find(StringUtil::Lower((*it)->aliases[i].GetIdentifierName()));
 			auto source = RunningColumn(*body->select_list[i]);
 			if (target != final_names.end() && !source.empty()) {
 				final_names.emplace(StringUtil::Lower(source), target->second);
@@ -613,15 +613,14 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	}
 	// Apply the partition restriction at the source, before blocking window operators.
 	// The suffix parser proved that every window uses this same partition key.
-	auto *scan =
-	    select->cte_map.map.empty() ? select : RunningSelect(*select->cte_map.map.begin()->second->query_node);
+	auto *scan = select->cte_map.map.empty() ? select : RunningSelect(*select->cte_map.map.begin()->second->query_node);
 	D_ASSERT(scan && !scan->where_clause);
 	auto &source = scan->from_table->Cast<BaseTableRef>();
 	auto source_alias = source.alias.empty() ? source.Table().GetIdentifierName() : source.alias.GetIdentifierName();
 	auto predicate = "EXISTS (SELECT 1 FROM " + fallback_table + " openivm_aff WHERE " +
 	                 QualifiedColumn("openivm_aff", plan.partition_column) + " IS NOT DISTINCT FROM " +
 	                 QualifiedColumn(source_alias, spec.source_column) + ")";
-	auto filters = Parser::ParseExpressionList(predicate);
+	auto filters = Parser(ParserOptions::Builtin()).ParseExpressionList(predicate);
 	scan->where_clause = std::move(filters[0]);
 	string fallback_query = statement->ToString();
 	OPENIVM_DEBUG_PRINT("[CompileWindowSuffixExtend] Pushed fallback partition filter into source scan\n");
@@ -819,7 +818,7 @@ static bool VisitQualifiedAlias(ParsedExpression &expression, const string &alia
 }
 
 static string RewriteQualifiedAliasPrefix(const string &expr, const string &source_alias, const string &target_alias) {
-	auto expressions = Parser::ParseExpressionList(expr);
+	auto expressions = Parser(ParserOptions::Builtin()).ParseExpressionList(expr);
 	D_ASSERT(expressions.size() == 1);
 	VisitQualifiedAlias(*expressions[0], source_alias, &target_alias);
 	return RefreshExpressionSQL(*expressions[0]);
@@ -829,7 +828,7 @@ static bool ReferencesQualifiedAlias(const string &expr, const string &alias) {
 	if (expr.empty()) {
 		return false;
 	}
-	auto expressions = Parser::ParseExpressionList(expr);
+	auto expressions = Parser(ParserOptions::Builtin()).ParseExpressionList(expr);
 	D_ASSERT(expressions.size() == 1);
 	return VisitQualifiedAlias(*expressions[0], alias, nullptr);
 }

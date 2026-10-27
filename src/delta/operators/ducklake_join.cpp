@@ -136,7 +136,7 @@ static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, con
 	             "JOIN (SELECT * FROM " +
 	             other_relation + ") openivm_other ON openivm_delta_keys.openivm_key = openivm_other." + other_col +
 	             " LIMIT 1)";
-	auto result = con.Query(sql);
+	auto result = MatQuery(con, sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe key-domain intersection: %s\n",
 		                    result->HasError() ? result->GetError().c_str() : "no result");
@@ -275,9 +275,9 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 	vector<string> table_schemas(N);
 	vector<string> table_names(N);
 	unordered_map<string, int64_t> stored_snapshots;
-	auto snapshot_result = con.Query("SELECT table_name, last_snapshot_id, source_catalog, source_schema FROM " +
-	                                 string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                                 SqlUtils::EscapeValue(input.context.view) + "'");
+	auto snapshot_result = MatQuery(con, "SELECT table_name, last_snapshot_id, source_catalog, source_schema FROM " +
+	                                         string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	                                         SqlUtils::EscapeValue(input.context.view) + "'");
 	if (snapshot_result->HasError()) {
 		throw Exception(ExceptionType::CATALOG, "IVM: could not read DuckLake snapshot metadata for view '" +
 		                                            input.context.view + "': " + snapshot_result->GetError());
@@ -307,7 +307,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			                                            "' in view '" + input.context.view + "'");
 		}
 		old_snapshots[i] = stored_snapshot->second;
-		if (get->function.name == "ducklake_scan" && get->function.function_info) {
+		if (get->function.GetName().GetIdentifierName() == "ducklake_scan" && get->function.function_info) {
 			auto &func_info = get->function.function_info->Cast<DuckLakeFunctionInfo>();
 			current_snapshots[i] = static_cast<int64_t>(func_info.snapshot.snapshot_id);
 		}
@@ -381,7 +381,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
 			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
 			    to_string(current_snapshots[i]) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
-			auto has_changes = con.Query(has_changes_sql);
+			auto has_changes = MatQuery(con, has_changes_sql);
 			if (has_changes->HasError()) {
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe changes for %s.%s.%s: %s\n",
 				                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
@@ -490,7 +490,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		if (!flattened_leaves) {
 			if (original_subtree_binding_count > 0) {
 				RemapParentProjectionMapForInsertedOutput(term, leaves[i].path, original_subtree_binding_count,
-				                                         mul_binding);
+				                                          mul_binding);
 			}
 			UpdateParentProjectionMap(term, leaves[i], mul_binding);
 		}
@@ -502,11 +502,12 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			auto *old_get = leaf_node->type == LogicalOperatorType::LOGICAL_GET
 			                    ? dynamic_cast<LogicalGet *>(leaf_node.get())
 			                    : FindGetInSubtree(leaf_node.get());
-			if (old_get && old_get->function.name == "ducklake_scan" && old_get->function.function_info) {
+			if (old_get && old_get->function.GetName().GetIdentifierName() == "ducklake_scan" &&
+			    old_get->function.function_info) {
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);
 				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned leaf %zu (table_index=%lu) to old snapshot %ld\n", j,
-				(unsigned long)old_get->table_index.index, (long)old_snapshots[j]);
+				                    (unsigned long)old_get->table_index.index, (long)old_snapshots[j]);
 			}
 		}
 

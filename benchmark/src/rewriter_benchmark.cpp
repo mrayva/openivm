@@ -4,11 +4,15 @@
 // Based on PAC's sqlstorm benchmark (fork/pipe isolation, crash handling, stats output).
 //
 
+#include "core/materialized_result.hpp"
 #include "duckdb.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
 #include "core/openivm_extension.hpp"
+#include "core/refresh_metadata.hpp"
+#include "core/sql_utils.hpp"
+#include "benchmark_metadata.hpp"
 #include "tpcc_helpers.hpp"
 #include "tpcdi_helpers.hpp"
 
@@ -152,7 +156,7 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 		if (c == '\'')
 			escaped += '\'';
 	}
-	auto info = con.Query("PRAGMA table_info('" + escaped + "')");
+	auto info = MatQuery(con, "PRAGMA table_info('" + escaped + "')");
 	if (!info || info->HasError() || info->RowCount() == 0) {
 		result.normalized = "*";
 		return result;
@@ -187,8 +191,7 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 // cancel rows that exist only on one side.
 static string BuildBagMismatchCountQuery(const string &left, const string &right) {
 	return "SELECT (SELECT COUNT(*) FROM ((" + left + ") EXCEPT ALL (" + right +
-	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left +
-	       ")) __right_diff)";
+	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left + ")) __right_diff)";
 }
 
 static string LowerASCII(string s) {
@@ -535,14 +538,14 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		duckdb::DuckDB db(db_path);
 		db.LoadStaticExtension<duckdb::OpenivmExtension>();
 		duckdb::Connection con(db);
-		con.Query("PRAGMA threads=4");
+		MatQuery(con, "PRAGMA threads=4");
 
 		// A few corpus queries mix TIMESTAMP columns with CURRENT_TIMESTAMP.
 		// DuckDB implements the required TIMESTAMPTZ conversion in ICU, so install
 		// it up front instead of turning a missing mid-run autoload into a query
 		// validation failure.
-		auto icu_install = con.Query("INSTALL icu");
-		auto icu_load = con.Query("LOAD icu");
+		auto icu_install = MatQuery(con, "INSTALL icu");
+		auto icu_load = MatQuery(con, "LOAD icu");
 		if ((icu_install && icu_install->HasError()) || (icu_load && icu_load->HasError())) {
 			fprintf(stderr, "Warning: ICU extension unavailable; timestamp validation may fail: %s%s\n",
 			        icu_install && icu_install->HasError() ? icu_install->GetError().c_str() : "",
@@ -555,40 +558,52 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		// `rewriter_benchmark_sf1` — not `memory`.
 		string native_catalog = "memory";
 		{
-			auto cur = con.Query("SELECT current_database()");
+			auto cur = MatQuery(con, "SELECT current_database()");
 			if (cur && !cur->HasError() && cur->RowCount() > 0) {
 				native_catalog = cur->GetValue(0, 0).ToString();
 			}
 		}
 		string quoted_native_catalog = duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog);
 		string native_use = "USE " + quoted_native_catalog + ".main";
+		// OpenIVM keeps control metadata in the native catalog's metadata schema
+		// (openivm_metadata_schema, main by default). Find it rather than assume main.
+		auto metadata_table = [&](const string &table) {
+			string schema = "main";
+			auto found = MatQuery(con, "SELECT schema_name FROM duckdb_tables() WHERE database_name = " +
+			                       duckdb::Value(native_catalog).ToSQLString() +
+			                       " AND table_name = 'openivm_views' ORDER BY schema_name LIMIT 1");
+			if (found && !found->HasError() && found->RowCount() > 0) {
+				schema = found->GetValue(0, 0).ToString();
+			}
+			return quoted_native_catalog + "." + duckdb::KeywordHelper::WriteOptionallyQuoted(schema) + "." + table;
+		};
 
 		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.
 		bool ducklake_ok = false;
 		if (workload == "tpcc") {
 			string dl_path = db_path + ".ducklake.db";
-			auto inst = con.Query("INSTALL ducklake");
-			auto ld = con.Query("LOAD ducklake");
+			auto inst = MatQuery(con, "INSTALL ducklake");
+			auto ld = MatQuery(con, "LOAD ducklake");
 			if ((!inst || !inst->HasError()) && (!ld || !ld->HasError())) {
 				string attach_sql = "ATTACH IF NOT EXISTS '" + dl_path + "' AS dl (TYPE ducklake)";
-				auto at = con.Query(attach_sql);
+				auto at = MatQuery(con, attach_sql);
 				if (at && !at->HasError()) {
 					ducklake_ok = true;
-					auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables "
+					auto have = MatQuery(con, "SELECT COUNT(*) FROM information_schema.tables "
 					                      "WHERE table_catalog = 'dl' AND LOWER(table_name) = 'warehouse'");
 					bool needs_init = !have || have->HasError() || have->RowCount() == 0 ||
 					                  have->GetValue(0, 0).GetValue<int64_t>() == 0;
 					if (needs_init) {
-						con.Query("USE dl.main");
+						MatQuery(con, "USE dl.main");
 						CreateTPCCSchema(con);
 						for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER",
 						                      "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
-							con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + quoted_native_catalog +
+							MatQuery(con, string("INSERT INTO ") + t + " SELECT * FROM " + quoted_native_catalog +
 							          ".main." + t);
 						}
-						con.Query(native_use);
+						MatQuery(con, native_use);
 					} else {
-						con.Query(native_use);
+						MatQuery(con, native_use);
 					}
 				}
 			}
@@ -598,30 +613,42 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		// DuckLake MVs (created with USE dl.main) land in dl.main.*, so we use catalog-qualified
 		// drops via information_schema which spans all catalogs.
 		{
+			// Metadata is keyed by an encoded internal key, not the SQL-facing mv_q* name. Record the
+			// leftover keys (and their data-table locations) before any DROP VIEW removes the rows.
+			auto leftover_keys = openivm_bench::ListLeftoverViews(con, native_catalog, "mv_q%");
 			// Drop views from all catalogs
-			auto leftover = con.Query("SELECT table_catalog, table_name FROM information_schema.views "
+			auto leftover = MatQuery(con, "SELECT table_catalog, table_name FROM information_schema.views "
 			                          "WHERE table_name LIKE 'mv_q%' AND table_schema = 'main'");
 			if (leftover && !leftover->HasError()) {
 				for (idx_t r = 0; r < leftover->RowCount(); r++) {
 					string cat = leftover->GetValue(0, r).ToString();
 					string vn = leftover->GetValue(1, r).ToString();
-					con.Query("DROP VIEW IF EXISTS " + cat + ".main." + vn);
+					MatQuery(con, "DROP VIEW IF EXISTS " + cat + ".main." + vn);
 				}
 			}
 			// Drop orphaned data/delta tables from all catalogs
-			auto orphaned = con.Query("SELECT table_catalog, table_name FROM information_schema.tables "
+			auto orphaned = MatQuery(con, "SELECT table_catalog, table_name FROM information_schema.tables "
 			                          "WHERE (table_name LIKE 'openivm_data_mv_q%' OR table_name LIKE "
 			                          "'openivm_delta_mv_q%') AND table_schema = 'main'");
 			if (orphaned && !orphaned->HasError()) {
 				for (idx_t r = 0; r < orphaned->RowCount(); r++) {
 					string cat = orphaned->GetValue(0, r).ToString();
 					string tn = orphaned->GetValue(1, r).ToString();
-					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
+					MatQuery(con, "DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
 			}
-			// Clean metadata tables (always in native catalog, unqualified)
-			con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			// A crashed child may leave encoded backing tables after its user view is gone.
+			for (auto &view : leftover_keys) {
+				MatQuery(con, "DROP TABLE IF EXISTS " +
+				          duckdb::SqlUtils::FullName(view.catalog, view.schema, "openivm_data_" + view.key));
+			}
+			// Clean orphaned metadata rows in the native catalog. Views are keyed internally;
+			// match their SQL names as well as legacy keys equal to the SQL name.
+			string orphan_views = "SELECT view_name FROM " + metadata_table("openivm_views") +
+			                      " WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%' OR view_name LIKE 'mv_q%'";
+			MatQuery(con, "DELETE FROM " + metadata_table("openivm_delta_tables") + " WHERE view_name IN (" + orphan_views +
+			          ")");
+			MatQuery(con, "DELETE FROM " + metadata_table("openivm_views") + " WHERE view_name IN (" + orphan_views + ")");
 		}
 
 		int delta_idx = 0;
@@ -688,9 +715,9 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			// table, delta view, and any deltas applied below all target the
 			// catalog active at execution time.
 			if (is_ducklake_query) {
-				con.Query("USE dl.main");
+				MatQuery(con, "USE dl.main");
 			} else {
-				con.Query(native_use);
+				MatQuery(con, native_use);
 			}
 
 			uint8_t phase_reached = 0;
@@ -703,7 +730,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			auto start = std::chrono::steady_clock::now();
 			try {
 				auto test_query = "SELECT * FROM (" + query + ") __q LIMIT 0";
-				auto test_result = con.Query(test_query);
+				auto test_result = MatQuery(con, test_query);
 				if (test_result && test_result->HasError()) {
 					error = test_result->GetError();
 					phase_reached = IsFatalError(error) ? PHASE_CRASH : PHASE_DUCKDB_VALIDATION_FAILED;
@@ -725,7 +752,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				start = std::chrono::steady_clock::now();
 				try {
 					string create_mv = "CREATE MATERIALIZED VIEW " + mv_name + " AS " + query;
-					auto mv_result = con.Query(create_mv);
+					auto mv_result = MatQuery(con, create_mv);
 					if (mv_result && mv_result->HasError()) {
 						error = mv_result->GetError();
 						if (IsFatalError(error)) {
@@ -744,15 +771,15 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Qualify with native_catalog so the lookup works both when the active catalog
 						// is a DuckLake catalog (USE dl.main) and when the DB is file-based (catalog
 						// name = filename, never "memory").
-						auto check_result = con.Query("SELECT type FROM " + quoted_native_catalog +
-						                              ".main.openivm_views WHERE view_name = '" + mv_name + "'");
-						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
-							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
-							is_incremental = (refresh_type != 3) ? 1 : 0;
+						// openivm_views.view_name holds an encoded internal key; the SQL-facing name is in
+						// view_sql_name. Resolve the qualified identity to its key via RefreshMetadata.
+						auto lookup = openivm_bench::LookupViewType(db, con, native_catalog, mv_name);
+						if (lookup.found) {
+							is_incremental = (lookup.type != 3) ? 1 : 0;
 						} else {
 							error = "OpenIVM metadata lookup failed for " + mv_name;
-							if (check_result && check_result->HasError()) {
-								error += ": " + check_result->GetError();
+							if (!lookup.error.empty()) {
+								error += ": " + lookup.error;
 							}
 							phase_reached = PHASE_MV_CREATION_FAILED;
 						}
@@ -761,7 +788,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						if (phase_reached == PHASE_DELTA_FAILED) {
 							for (int d = 0; d < delta_batch_size && (size_t)delta_idx < deltas.size();
 							     d++, delta_idx++) {
-								con.Query(deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
+								MatQuery(con, deltas[delta_idx]); // Errors are OK (e.g. duplicate keys)
 							}
 							if ((size_t)delta_idx >= deltas.size())
 								delta_idx = 0;
@@ -771,7 +798,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// Phase 4: PRAGMA refresh()
 						start = std::chrono::steady_clock::now();
 						auto refresh_result = phase_reached == PHASE_REFRESH_FAILED
-						                          ? con.Query("PRAGMA refresh('" + mv_name + "')")
+						                          ? MatQuery(con, "PRAGMA refresh('" + mv_name + "')")
 						                          : nullptr;
 						if (refresh_result && refresh_result->HasError()) {
 							error = refresh_result->GetError();
@@ -812,7 +839,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 								string gt_select = "SELECT " + nv.normalized + " FROM gt_r";
 								verify_query = ctes + BuildBagMismatchCountQuery(mv_select, gt_select);
 							}
-							auto verify_result = con.Query(verify_query);
+							auto verify_result = MatQuery(con, verify_query);
 							if (verify_result && !verify_result->HasError() && verify_result->RowCount() > 0) {
 								int64_t mismatch_count = verify_result->GetValue(0, 0).GetValue<int64_t>();
 								if (mismatch_count != 0 && !nv.column_list.empty()) {
@@ -835,7 +862,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 										string mv_select = "SELECT " + non_window_select + " FROM mv_r";
 										string gt_select = "SELECT " + non_window_select + " FROM gt_r";
 										string relaxed_query = ctes + BuildBagMismatchCountQuery(mv_select, gt_select);
-										auto relaxed_result = con.Query(relaxed_query);
+										auto relaxed_result = MatQuery(con, relaxed_query);
 										if (relaxed_result && !relaxed_result->HasError() &&
 										    relaxed_result->RowCount() > 0 &&
 										    relaxed_result->GetValue(0, 0).GetValue<int64_t>() == 0) {
@@ -866,7 +893,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 										            nv.normalized + " FROM mv_r LIMIT 10";
 									}
 									auto dump_side = [&](const string &label, const string &q) {
-										auto rows = con.Query(q);
+										auto rows = MatQuery(con, q);
 										if (!rows || rows->HasError()) {
 											fprintf(stderr, "[DIFF %s]   %s: ERROR %s\n", mv_name.c_str(),
 											        label.c_str(), rows ? rows->GetError().c_str() : "(null)");
@@ -901,7 +928,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 
 					// Cleanup — use DROP VIEW (not DROP MATERIALIZED VIEW; DuckDB intercepts
 					// that before OpenIVM, so it silently fails to clean metadata).
-					con.Query("DROP VIEW IF EXISTS " + mv_name);
+					MatQuery(con, "DROP VIEW IF EXISTS " + mv_name);
 
 				} catch (std::exception &e) {
 					error = e.what();
@@ -1278,7 +1305,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 					CreateTPCCSchema(con);
 					InsertTPCCData(con, scale_factor);
 				}
-				con.Query("PRAGMA checkpoint");
+				MatQuery(con, "PRAGMA checkpoint");
 			}
 			_exit(0);
 		}

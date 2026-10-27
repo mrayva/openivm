@@ -13,9 +13,11 @@
 // during a run, DML-during-refresh, and DuckLake variants.
 //
 
+#include "core/materialized_result.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
+#include "daemon_metadata.hpp"
 #include "tpcc_helpers.hpp"
 
 #include <atomic>
@@ -547,7 +549,7 @@ static bool IsTransientDmlConflict(const string &msg) {
 static string ExecuteDmlWithRetry(duckdb::Connection &con, const string &sql) {
 	constexpr int MAX_DML_ATTEMPTS = 5;
 	for (int attempt = 0; attempt < MAX_DML_ATTEMPTS; attempt++) {
-		auto r = con.Query(sql);
+		auto r = MatQuery(con, sql);
 		if (r && !r->HasError()) {
 			return "";
 		}
@@ -565,7 +567,7 @@ static void DMLThread(SubtestCtx &ctx, int interval_ms, size_t delta_start_offse
 	// DuckLake sub-tests need DML to hit dl.main.* (so each write advances the
 	// DuckLake snapshot and the daemon's skip-empty-deltas check doesn't bail).
 	if (ctx.subtest == "S9" || ctx.subtest == "S10" || ctx.subtest == "S11") {
-		con.Query("USE dl.main");
+		MatQuery(con, "USE dl.main");
 	}
 	size_t idx = delta_start_offset;
 	while (!ctx.stop.load()) {
@@ -593,7 +595,7 @@ static void CheckerThread(SubtestCtx &ctx, int interval_ms) {
 	if (ctx.subtest == "S9" || ctx.subtest == "S11") {
 		// MVs are in dl.main; qualified names in MVDef.QualifiedName() handle
 		// this, but the base_query's unqualified column refs need dl.main active.
-		con.Query("USE dl.main");
+		MatQuery(con, "USE dl.main");
 	}
 	while (!ctx.stop.load()) {
 		for (auto &v : ctx.mvs) {
@@ -604,7 +606,7 @@ static void CheckerThread(SubtestCtx &ctx, int interval_ms) {
 			           "  UNION ALL "
 			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() +
 			           ") __diff";
-			auto r = con.Query(q);
+			auto r = MatQuery(con, q);
 			{
 				lock_guard<mutex> lk(ctx.log_mu);
 				ctx.summary.checker_runs++;
@@ -661,7 +663,7 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 		// up yet — delta should have rows. If last_dml_ts <= last_update globally
 		// across ALL views referencing this delta, the rows should have been
 		// cleaned by the DELETE FROM delta_<table> WHERE ts < MIN(last_update).
-		auto meta = con.Query(
+		auto meta = MatQuery(con, 
 		    "SELECT view_name, table_name, last_update FROM openivm_delta_tables "
 		    "WHERE catalog_type = 'duckdb' OR catalog_type IS NULL");
 		if (!meta || meta->HasError()) continue;
@@ -674,15 +676,15 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			string key = view_name + "|" + delta_table;
 			string newer_q = "SELECT COUNT(*) FROM " + delta_table + " WHERE openivm_timestamp > '" +
 			                  last_update + "'::TIMESTAMP";
-			auto newer_r = con.Query(newer_q);
+			auto newer_r = MatQuery(con, newer_q);
 			if (!newer_r || newer_r->HasError()) continue;
 			int64_t newer_count = newer_r->GetValue(0, 0).GetValue<int64_t>();
 			// Did DML happen for this table? Check total delta row count
-			auto total_r = con.Query("SELECT COUNT(*) FROM " + delta_table);
+			auto total_r = MatQuery(con, "SELECT COUNT(*) FROM " + delta_table);
 			if (!total_r || total_r->HasError()) continue;
 			int64_t total_count = total_r->GetValue(0, 0).GetValue<int64_t>();
 			// Invariant 1: if total > 0 and last_update is < MAX(ts in delta), newer_count > 0
-			auto maxts_r = con.Query("SELECT MAX(openivm_timestamp) FROM " + delta_table);
+			auto maxts_r = MatQuery(con, "SELECT MAX(openivm_timestamp) FROM " + delta_table);
 			if (!maxts_r || maxts_r->HasError() || maxts_r->RowCount() == 0 || maxts_r->GetValue(0, 0).IsNull()) {
 				missing_streak[key] = 0;
 			} else {
@@ -703,10 +705,10 @@ static void DeltaSanityThread(SubtestCtx &ctx, int interval_ms) {
 			// Invariant 2: delta rows older than MIN(last_update) across all
 			// views using this delta should have been cleaned up.
 			auto minlu_r =
-			    con.Query("SELECT MIN(last_update) FROM openivm_delta_tables WHERE table_name = '" + base_table + "'");
+			    MatQuery(con, "SELECT MIN(last_update) FROM openivm_delta_tables WHERE table_name = '" + base_table + "'");
 			if (minlu_r && !minlu_r->HasError() && minlu_r->RowCount() > 0 && !minlu_r->GetValue(0, 0).IsNull()) {
 				string min_lu = minlu_r->GetValue(0, 0).ToString();
-				auto stale_r = con.Query("SELECT COUNT(*) FROM " + delta_table +
+				auto stale_r = MatQuery(con, "SELECT COUNT(*) FROM " + delta_table +
 				                          " WHERE openivm_timestamp < '" + min_lu + "'::TIMESTAMP");
 				if (stale_r && !stale_r->HasError()) {
 					int64_t stale_count = stale_r->GetValue(0, 0).GetValue<int64_t>();
@@ -734,7 +736,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 	// Refresh bumps `openivm_delta_tables.last_update` (one row per source
 	// table per MV). Per MV we track MAX(last_update) across its source tables.
 	map<string, string> prev_update;
-	auto r0 = con.Query(
+	auto r0 = MatQuery(con, 
 	    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 	if (r0 && !r0->HasError()) {
 		for (idx_t i = 0; i < r0->RowCount(); i++) {
@@ -743,7 +745,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 		}
 	}
 	while (!ctx.stop.load()) {
-		auto r = con.Query(
+		auto r = MatQuery(con, 
 		    "SELECT view_name, MAX(last_update) FROM openivm_delta_tables GROUP BY view_name");
 		if (r && !r->HasError()) {
 			for (idx_t i = 0; i < r->RowCount(); i++) {
@@ -756,7 +758,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 					ctx.summary.refresh_events++;
 					ctx.summary.per_mv_refreshes[vn]++;
 					// Duration from refresh_history if populated (adaptive mode); else 0
-					auto hr = con.Query("SELECT actual_duration_ms FROM openivm_refresh_history "
+					auto hr = MatQuery(con, "SELECT actual_duration_ms FROM openivm_refresh_history "
 					                    "WHERE view_name = '" + vn +
 					                    "' ORDER BY refresh_timestamp DESC LIMIT 1");
 					double dur = 0;
@@ -781,7 +783,7 @@ static void MonitorThread(SubtestCtx &ctx, int interval_ms) {
 static void ManualRefreshThread(SubtestCtx &ctx, vector<string> target_mvs, int interval_ms) {
 	duckdb::Connection con(*ctx.db);
 	if (ctx.subtest == "S11") {
-		con.Query("USE dl.main");
+		MatQuery(con, "USE dl.main");
 	}
 	size_t idx = 0;
 	while (!ctx.stop.load()) {
@@ -791,7 +793,7 @@ static void ManualRefreshThread(SubtestCtx &ctx, vector<string> target_mvs, int 
 		}
 		const string &vn = target_mvs[idx % target_mvs.size()];
 		auto t0 = NowMs();
-		auto r = con.Query("PRAGMA refresh('" + vn + "')");
+		auto r = MatQuery(con, "PRAGMA refresh('" + vn + "')");
 		auto t1 = NowMs();
 		{
 			lock_guard<mutex> lk(ctx.log_mu);
@@ -827,8 +829,8 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 	try {
 		ctx.db = std::make_shared<duckdb::DuckDB>(db_path);
 		duckdb::Connection con(*ctx.db);
-		con.Query("PRAGMA threads=4");
-		auto lr = con.Query("LOAD openivm");
+		MatQuery(con, "PRAGMA threads=4");
+		auto lr = MatQuery(con, "LOAD openivm");
 		if (!lr || lr->HasError()) {
 			ctx.summary.findings.push_back("LOAD openivm failed");
 			string s = ctx.summary.ToJson() + "\n";
@@ -836,28 +838,28 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 			return 2;
 		}
 		// Clear any stale refresh_in_progress from previous crashed runs.
-		con.Query("UPDATE openivm_views SET refresh_in_progress = false");
+		MatQuery(con, "UPDATE openivm_views SET refresh_in_progress = false");
 
 		// Per-subtest cascade mode + daemon settings
 		if (subtest == "S1") ctx.cascade_mode = "upstream";
 		else if (subtest == "S2") ctx.cascade_mode = "downstream";
 		else if (subtest == "S3") ctx.cascade_mode = "both";
 		else if (subtest == "S9") ctx.cascade_mode = "upstream";
-		con.Query("SET GLOBAL openivm_cascade_refresh = '" + ctx.cascade_mode + "'");
+		MatQuery(con, "SET GLOBAL openivm_cascade_refresh = '" + ctx.cascade_mode + "'");
 		// Enable adaptive refresh GLOBALLY so the daemon (its own connection)
 		// and all worker threads see the flag and populate `openivm_refresh_history`.
-		con.Query("SET GLOBAL openivm_adaptive_refresh = true");
+		MatQuery(con, "SET GLOBAL openivm_adaptive_refresh = true");
 		ctx.summary.cascade_mode = ctx.cascade_mode;
 
 		if (subtest == "S4" || subtest == "S5" || subtest == "S6" || subtest == "S11") {
-			con.Query("SET openivm_disable_daemon = true");
+			MatQuery(con, "SET openivm_disable_daemon = true");
 			ctx.disable_daemon = true;
 		}
 
 		// Clean up any leftover MVs / data tables / delta tables from a previous
 		// crashed sub-test. Walk ALL catalogs (native + any attached) so DuckLake
 		// artifacts left by S9/S10/S11 don't leak into the next sub-test.
-		auto leftover = con.Query(
+		auto leftover = MatQuery(con, 
 		    "SELECT table_catalog, table_schema, table_name FROM information_schema.tables "
 		    "WHERE table_name LIKE 'mv_%' OR table_name LIKE 'openivm_data_mv_%' OR table_name LIKE "
 		    "'openivm_delta_mv_%'");
@@ -867,34 +869,34 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				string schema = leftover->GetValue(1, i).ToString();
 				string tn = leftover->GetValue(2, i).ToString();
 				string full = cat + "." + schema + "." + tn;
-				con.Query("DROP VIEW IF EXISTS " + full);
-				con.Query("DROP TABLE IF EXISTS " + full);
+				MatQuery(con, "DROP VIEW IF EXISTS " + full);
+				MatQuery(con, "DROP TABLE IF EXISTS " + full);
 			}
 		}
-		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_delta_tables WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_history WHERE view_name LIKE 'mv_%'");
-		con.Query("DELETE FROM openivm_refresh_hooks WHERE view_name LIKE 'mv_%'");
+		// Metadata rows are keyed by the internal view key; select them via the SQL name.
+		for (auto &stmt : openivm_bench::StaleBenchmarkMetadataCleanupSQL()) {
+			MatQuery(con, stmt);
+		}
 
 		// DuckLake attach for S9/S10/S11
 		if (subtest == "S9" || subtest == "S10" || subtest == "S11") {
-			con.Query("INSTALL ducklake");
-			con.Query("LOAD ducklake");
+			MatQuery(con, "INSTALL ducklake");
+			MatQuery(con, "LOAD ducklake");
 			string dl_path = db_path + ".ducklake.db";
-			auto at = con.Query("ATTACH IF NOT EXISTS '" + dl_path + "' AS dl (TYPE ducklake)");
+			auto at = MatQuery(con, "ATTACH IF NOT EXISTS '" + dl_path + "' AS dl (TYPE ducklake)");
 			if (!at || at->HasError()) {
 				ctx.summary.findings.push_back("DuckLake attach failed: " +
 				                                (at ? at->GetError() : "null"));
 			} else {
 				// Populate DuckLake TPC-C once
-				auto have = con.Query("SELECT COUNT(*) FROM information_schema.tables WHERE "
+				auto have = MatQuery(con, "SELECT COUNT(*) FROM information_schema.tables WHERE "
 				                      "table_catalog='dl' AND LOWER(table_name)='warehouse'");
 				bool needs_init = !have || have->HasError() || have->RowCount() == 0 ||
 				                  have->GetValue(0, 0).GetValue<int64_t>() == 0;
 				if (needs_init) {
-					con.Query("USE dl.main");
+					MatQuery(con, "USE dl.main");
 					CreateTPCCSchema(con);
-					auto probe = con.Query("SELECT current_database()");
+					auto probe = MatQuery(con, "SELECT current_database()");
 					string native_cat = "memory";
 					if (probe && !probe->HasError() && probe->RowCount() > 0) {
 						native_cat = probe->GetValue(0, 0).ToString();
@@ -912,15 +914,15 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					}
 					for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK",
 					                       "OORDER", "NEW_ORDER", "ORDER_LINE", "HISTORY"}) {
-						con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_cat +
+						MatQuery(con, string("INSERT INTO ") + t + " SELECT * FROM " + native_cat +
 						          ".main." + t);
 					}
-					con.Query("USE " + native_cat + ".main");
+					MatQuery(con, "USE " + native_cat + ".main");
 				}
 				// For S10 MVs read from dl.<table> directly on native context
 				// For S9/S11 MVs are in dl.main — set USE
 				if (subtest == "S9" || subtest == "S11") {
-					con.Query("USE dl.main");
+					MatQuery(con, "USE dl.main");
 				}
 			}
 		}
@@ -931,7 +933,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 
 		// Create all MVs
 		for (auto &v : ctx.mvs) {
-			auto r = con.Query(v.create_sql);
+			auto r = MatQuery(con, v.create_sql);
 			if (!r || r->HasError()) {
 				ctx.summary.findings.push_back("MV creation failed: " + v.name + " : " +
 				                                (r ? r->GetError() : "null"));
@@ -1031,13 +1033,13 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				duckdb::Connection alter_con(*ctx.db);
 				this_thread::sleep_for(chrono::seconds(120));
 				if (ctx.stop.load()) return;
-				auto r1 = alter_con.Query(
+				auto r1 = MatQuery(alter_con, 
 				    "ALTER MATERIALIZED VIEW mv_ind1 SET REFRESH EVERY '1 minute'");
 				ctx.LogEvent("alter", "mv_ind1",
 				              r1 && !r1->HasError() ? "set 1m" : (r1 ? r1->GetError() : "null"));
 				this_thread::sleep_for(chrono::seconds(120));
 				if (ctx.stop.load()) return;
-				auto r2 = alter_con.Query(
+				auto r2 = MatQuery(alter_con, 
 				    "ALTER MATERIALIZED VIEW mv_ind1 SET REFRESH EVERY '10 minutes'");
 				ctx.LogEvent("alter", "mv_ind1",
 				              r2 && !r2->HasError() ? "set 10m" : (r2 ? r2->GetError() : "null"));
@@ -1056,19 +1058,19 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 		// Final consistency check on every MV with a base_query
 		duckdb::Connection fin_con(*ctx.db);
 		if (subtest == "S9" || subtest == "S11") {
-			fin_con.Query("USE dl.main");
+			MatQuery(fin_con, "USE dl.main");
 		}
 		for (auto &v : ctx.mvs) {
 			if (v.base_query.empty()) continue;
 			// Drain deltas with multiple refreshes — catches "pending after one refresh" races.
-			fin_con.Query("PRAGMA refresh('" + v.name + "')");
-			fin_con.Query("PRAGMA refresh('" + v.name + "')");
+			MatQuery(fin_con, "PRAGMA refresh('" + v.name + "')");
+			MatQuery(fin_con, "PRAGMA refresh('" + v.name + "')");
 			string q = "SELECT COUNT(*) FROM ("
 			           "  SELECT * FROM " + v.QualifiedName() + " EXCEPT ALL SELECT * FROM (" + v.base_query + ") __a"
 			           "  UNION ALL "
 			           "  SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " + v.QualifiedName() +
 			           ") __diff";
-			auto r = fin_con.Query(q);
+			auto r = MatQuery(fin_con, q);
 			if (!r || r->HasError()) {
 				ctx.summary.findings.push_back("final check errored on " + v.name + ": " +
 				                                (r ? r->GetError() : "null"));
@@ -1081,16 +1083,14 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					// last_update. Helps diagnose whether rows are "stuck" in delta (not applied)
 					// vs the refresh applied something wrong.
 					string diag;
-					auto dt_r = fin_con.Query(
-					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name = '" +
-					    v.name + "'");
+					auto dt_r = MatQuery(fin_con, openivm_bench::DeltaMetadataDiagnosticSQL(v.name, v.catalog_schema));
 					if (dt_r && !dt_r->HasError()) {
 						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
 							string tn = dt_r->GetValue(0, di).ToString();
 							string lu = dt_r->GetValue(1, di).IsNull() ? "NULL" : dt_r->GetValue(1, di).ToString();
-							auto cnt_r = fin_con.Query("SELECT COUNT(*) FROM delta_" + tn);
+							auto cnt_r = MatQuery(fin_con, "SELECT COUNT(*) FROM delta_" + tn);
 							int64_t c = (cnt_r && !cnt_r->HasError()) ? cnt_r->GetValue(0, 0).GetValue<int64_t>() : -1;
-							auto newer_r = fin_con.Query(
+							auto newer_r = MatQuery(fin_con, 
 							    "SELECT COUNT(*) FROM delta_" + tn +
 							    " WHERE openivm_timestamp >= '" + lu + "'::TIMESTAMP");
 							int64_t nc = (newer_r && !newer_r->HasError()) ? newer_r->GetValue(0, 0).GetValue<int64_t>() : -1;
@@ -1105,8 +1105,8 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					                    v.base_query + ") __a LIMIT 5";
 					string only_base_q = "SELECT * FROM (" + v.base_query + ") __b EXCEPT ALL SELECT * FROM " +
 					                      v.QualifiedName() + " LIMIT 5";
-					auto mv_r = fin_con.Query(only_mv_q);
-					auto base_r = fin_con.Query(only_base_q);
+					auto mv_r = MatQuery(fin_con, only_mv_q);
+					auto base_r = MatQuery(fin_con, only_base_q);
 					string detail = "final mismatch on " + v.name + ": " + std::to_string(mis) + " rows";
 					if (mv_r && !mv_r->HasError() && mv_r->RowCount() > 0) {
 						detail += "; only_in_mv=[";
@@ -1185,7 +1185,7 @@ int main(int argc, char **argv) {
 				duckdb::Connection con(db);
 				CreateTPCCSchema(con);
 				InsertTPCCData(con, scale);
-				con.Query("PRAGMA checkpoint");
+				MatQuery(con, "PRAGMA checkpoint");
 			}
 			_exit(0);
 		}

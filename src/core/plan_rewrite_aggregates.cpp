@@ -37,9 +37,8 @@ AggregateFunction BindAggregateByName(ClientContext &context, const string &name
 	return *entry.functions.GetFunctionByOffset(best.GetIndex());
 }
 
-static unique_ptr<BoundAggregateExpression>
-BindAggregateExpressionByName(ClientContext &context, const string &name,
-                              vector<unique_ptr<Expression>> children) {
+static unique_ptr<BoundAggregateExpression> BindAggregateExpressionByName(ClientContext &context, const string &name,
+                                                                          vector<unique_ptr<Expression>> children) {
 	vector<LogicalType> argument_types;
 	argument_types.reserve(children.size());
 	for (auto &child : children) {
@@ -427,9 +426,9 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 		    IsStddevVariant(d.func_name) ? opt.BindScalarFunction("sqrt", std::move(var_expr)) : std::move(var_expr);
 		int64_t threshold = IsPopulationVariant(d.func_name) ? 0 : 1;
 		auto count_check = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
-		auto when_expr = BoundComparisonExpression::Create(
-		    ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
-		    make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
+		auto when_expr =
+		    BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
+		                                      make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
 		auto else_expr = make_uniq<BoundConstantExpression>(Value(formula->GetReturnType()));
 		return make_uniq<BoundCaseExpression>(std::move(when_expr), std::move(formula), std::move(else_expr));
 	};
@@ -456,9 +455,8 @@ void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalOperator
 		if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 			auto &bcr = expr->Cast<BoundColumnRefExpression>();
 			if (bcr.Binding().table_index == agg.aggregate_index) {
-				uint64_t key =
-				    (uint64_t)bcr.Binding().table_index.index ^
-				    ((uint64_t)bcr.Binding().column_index.GetIndexUnsafe() * 0x9e3779b97f4a7c15ULL);
+				uint64_t key = (uint64_t)bcr.Binding().table_index.index ^
+				               ((uint64_t)bcr.Binding().column_index.GetIndexUnsafe() * 0x9e3779b97f4a7c15ULL);
 				auto dit = old_binding_to_decomp.find(key);
 				if (dit != old_binding_to_decomp.end()) {
 					auto replacement = build_replacement(*dit->second);

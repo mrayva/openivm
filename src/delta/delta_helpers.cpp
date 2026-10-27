@@ -27,7 +27,7 @@
 namespace duckdb {
 
 void PopulateDuckLakeChangeScanParameters(LogicalGet &get) {
-	if (get.function.name != "ducklake_scan" || !get.function.function_info) {
+	if (get.function.GetName().GetIdentifierName() != "ducklake_scan" || !get.function.function_info) {
 		return;
 	}
 	auto &info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
@@ -73,7 +73,8 @@ static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalO
 	remap_proj->ResolveOperatorTypes();
 
 	// Multiplicity is appended by both delta producers and is therefore the final binding.
-	ColumnBinding remapped_mul(output_table_index, ProjectionIndex(input_bindings.size() - 1)); // mull-ignore: cxx_sub_to_add
+	ColumnBinding remapped_mul(output_table_index,
+	                           ProjectionIndex(input_bindings.size() - 1)); // mull-ignore: cxx_sub_to_add
 	return {std::move(remap_proj), remapped_mul};
 }
 
@@ -153,9 +154,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s'\n", catalog_name.c_str(), table_name.c_str());
 
 	// Reuse the compiler metadata connection, including its transaction-local snapshot.
-	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
-	                             RefreshMetadata::SourcePredicate(table_name, catalog_name, schema_name));
+	auto snap_result = MatQuery(con, "SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	                                     " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
+	                                     RefreshMetadata::SourcePredicate(table_name, catalog_name, schema_name));
 	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: no snapshot ID recorded for DuckLake table '" + table_name + "' in view '" + view_name +
@@ -207,8 +208,9 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	// Helper: create a LogicalGet configured as a DuckLake change scan.
 	auto make_change_scan = [&](DuckLakeScanType scan_type, TableIndex table_idx) -> unique_ptr<LogicalGet> {
 		unique_ptr<FunctionData> bind_data;
-		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY,
-		                       QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table_name)));
+		EntryLookupInfo lookup(
+		    CatalogType::TABLE_ENTRY,
+		    QualifiedName(Identifier(catalog_name), Identifier(schema_name), Identifier(table_name)));
 		auto scan_fn = table_ref->Cast<TableCatalogEntry>().GetScanFunction(context, bind_data, lookup);
 
 		auto &func_info = scan_fn.function_info->Cast<DuckLakeFunctionInfo>();
@@ -222,8 +224,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 			col_names.emplace_back(name);
 		}
 
-		auto get = make_uniq<LogicalGet>(table_idx, std::move(scan_fn), std::move(bind_data), std::move(col_types),
-		                                 std::move(col_names));
+		auto get = make_uniq<LogicalGet>(table_idx, BoundTableFunction(scan_fn), std::move(bind_data),
+		                                 std::move(col_types), std::move(col_names));
 		get->SetColumnIds(vector<ColumnIndex>(delta_col_ids));
 		get->table_filters = std::move(*old_get->table_filters.Copy());
 
@@ -312,17 +314,15 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	}
 
 	optional_ptr<TableCatalogEntry> opt_catalog_entry;
+	// Metadata keys the delta by its source; the physical table may sit in an internal schema.
+	string delta_key = SqlUtils::DeltaName(source_table->name.GetIdentifierName());
+	string source_catalog = source_table->catalog.GetName().GetIdentifierName();
+	string source_schema = source_table->schema.name.GetIdentifierName();
 	{
-		string source_name = source_table->name.GetIdentifierName();
-		string delta_table = SqlUtils::DeltaName(source_name);
-		string delta_table_schema = source_table->schema.name.GetIdentifierName();
-		string delta_table_catalog = source_table->catalog.GetName().GetIdentifierName();
-		QueryErrorContext error_context;
-		opt_catalog_entry = Catalog::GetEntry<TableCatalogEntry>(
-		    context, QualifiedName(Identifier(delta_table_catalog), Identifier(delta_table_schema), Identifier(delta_table)),
-		    OnEntryNotFound::RETURN_NULL, error_context);
+		opt_catalog_entry = RefreshMetadata::FindSourceDelta(context, source_catalog, source_schema,
+		                                                     source_table->name.GetIdentifierName());
 		if (opt_catalog_entry == nullptr) {
-			throw Exception(ExceptionType::BINDER, "Table " + delta_table + " does not exist, no deltas to compute!");
+			throw Exception(ExceptionType::BINDER, "Table " + delta_key + " does not exist, no deltas to compute!");
 		}
 	}
 	auto &table_entry = opt_catalog_entry->Cast<TableCatalogEntry>();
@@ -357,24 +357,33 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 			// Map to multiplicity column instead.
 			column_ids.push_back(ColumnIndex(mul_oid));
 		} else {
-			column_ids.push_back(id);
+			// Replacement and ALTER can change source ordinals without changing
+			// the retained delta layout. Column identity is its name, not its slot.
+			auto &column = table_entry.GetColumn(old_get->GetColumnName(id));
+			ColumnIndex mapped(column.Oid(), id.GetChildIndexes());
+			if (id.HasType()) {
+				if (id.IsPushdownExtract()) {
+					mapped.SetPushdownExtractType(id.GetType());
+				} else {
+					mapped.SetType(id.GetType());
+				}
+			}
+			column_ids.push_back(std::move(mapped));
 		}
 	}
 	column_ids.push_back(ColumnIndex(mul_oid));
 	column_ids.push_back(ColumnIndex(ts_oid));
 
-	delta_get_node = make_uniq<LogicalGet>(old_get->table_index, scan_function, std::move(bind_data),
-	                                       std::move(return_types), std::move(return_names));
+	delta_get_node = make_uniq<LogicalGet>(old_get->table_index, BoundTableFunction(scan_function),
+	                                       std::move(bind_data), std::move(return_types), std::move(return_names));
 	delta_get_node->SetColumnIds(std::move(column_ids));
 	delta_get_node->table_filters = std::move(*old_get->table_filters.Copy());
 
 	// Timestamp filter
-	auto timestamp_query =
-	    "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
-	    SqlUtils::EscapeValue(view_name) + "' and " +
-	    RefreshMetadata::SourcePredicate(table_name, table_entry.ParentCatalog().GetName().GetIdentifierName(),
-	                                     table_entry.schema.name.GetIdentifierName());
-	auto r = con.Query(timestamp_query);
+	auto timestamp_query = "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
+	                       SqlUtils::EscapeValue(view_name) + "' and " +
+	                       RefreshMetadata::SourcePredicate(delta_key, source_catalog, source_schema);
+	auto r = MatQuery(con, timestamp_query);
 	if (r->HasError()) {
 		throw Exception(ExceptionType::EXECUTOR, "IVM: failed to read last_update for view '" + view_name +
 		                                             "', table '" + table_name + "': " + r->GetError());
@@ -390,8 +399,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	unique_ptr<Expression> timestamp_ref = make_uniq<BoundReferenceExpression>(LogicalType::TIMESTAMP, 0);
 	unique_ptr<Expression> timestamp_const = make_uniq<BoundConstantExpression>(std::move(ts_value));
 	auto timestamp_predicate = BoundComparisonExpression::Create(ExpressionType::COMPARE_GREATERTHANOREQUALTO,
-	                                                            std::move(timestamp_ref),
-	                                                            std::move(timestamp_const));
+	                                                             std::move(timestamp_ref), std::move(timestamp_const));
 	auto table_filter = make_uniq<ExpressionFilter>(std::move(timestamp_predicate));
 	// TableFilterSet keys are positions in LogicalGet::GetColumnIds(), not source-table column IDs.
 	// The timestamp column is appended last to this delta scan, so use its output position.
@@ -411,7 +419,8 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	new_mul_binding = delta_get_node->GetColumnBindings().back();
 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
 	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index.index,
-	                    (unsigned long)new_mul_binding.column_index.GetIndexUnsafe(), delta_get_node->GetColumnIds().size());
+	                    (unsigned long)new_mul_binding.column_index.GetIndexUnsafe(),
+	                    delta_get_node->GetColumnIds().size());
 	if (CompactDeltasEnabled(context)) {
 		return CompactDeltaNode(context, binder, std::move(delta_get_node), old_get->table_index, new_mul_binding);
 	}

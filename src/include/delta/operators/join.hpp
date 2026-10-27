@@ -25,7 +25,7 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
                                const ColumnBinding &mul_binding);
 
 void RemapParentProjectionMapForInsertedOutput(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
-                                              idx_t original_child_width, const ColumnBinding &mul_binding);
+                                               idx_t original_child_width, const ColumnBinding &mul_binding);
 
 void AppendMultiplicityToAncestorProjectionMaps(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                 const ColumnBinding &mul_binding, const char *context_label,

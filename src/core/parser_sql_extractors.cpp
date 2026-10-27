@@ -21,7 +21,7 @@ namespace duckdb {
 namespace {
 
 static unique_ptr<SelectStatement> ParseSelect(const string &sql) {
-	Parser parser;
+	Parser parser(ParserOptions::Builtin());
 	try {
 		parser.ParseQuery(sql);
 	} catch (const ParserException &) {
@@ -146,7 +146,7 @@ static bool IsSimpleExistsProjection(const SelectNode &select) {
 static bool ContainsSubquery(const ParsedExpression &expression) {
 	bool found = false;
 	ParsedExpressionIterator::VisitExpression<SubqueryExpression>(expression,
-	                                                               [&](const SubqueryExpression &) { found = true; });
+	                                                              [&](const SubqueryExpression &) { found = true; });
 	return found;
 }
 
@@ -386,9 +386,10 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	auto original_right_alias = out.right_alias;
 	out.right_alias = "openivm_right";
 	out.left_key_col = "openivm_saj_key";
-	out.left_key_expr = simple_left ? RenameQualifier(*subquery->GetChild(), out.left_table, out.left_alias, out.left_alias)
-	                                : SqlUtils::QuoteIdentifier(out.left_alias) + "." +
-	                                      SqlUtils::QuoteIdentifier(subquery->GetChild()->GetName().GetIdentifierName());
+	out.left_key_expr = simple_left
+	                        ? RenameQualifier(*subquery->GetChild(), out.left_table, out.left_alias, out.left_alias)
+	                        : SqlUtils::QuoteIdentifier(out.left_alias) + "." +
+	                              SqlUtils::QuoteIdentifier(subquery->GetChild()->GetName().GetIdentifierName());
 	out.right_key_expr =
 	    RenameQualifier(*right->select_list[0], out.right_table, original_right_alias, out.right_alias);
 	out.predicate = out.left_key_expr + " = " + out.right_key_expr;

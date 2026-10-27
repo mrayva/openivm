@@ -16,6 +16,7 @@
 //                  [--filter Q1,Q2,...] [--keep-db]
 //
 
+#include "core/materialized_result.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
@@ -455,7 +456,7 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 
 	duckdb::DuckDB db(my_db);
 	duckdb::Connection con(db);
-	auto load = con.Query("LOAD openivm");
+	auto load = MatQuery(con, "LOAD openivm");
 	if (!load || load->HasError()) {
 		SetErr(r, "LOAD openivm: " + (load ? load->GetError() : "null"));
 		return false;
@@ -463,35 +464,35 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 	// Contain DuckDB spill files inside our per-child directory so they get
 	// cleaned up alongside the DB. Defaults to inside the DB's directory which
 	// is fine, but explicit beats implicit + it's easier to monitor /tmp usage.
-	con.Query("PRAGMA temp_directory = '" + tp.spill_dir + "'");
+	MatQuery(con, "PRAGMA temp_directory = '" + tp.spill_dir + "'");
 
 	// 2. DuckLake setup if needed
 	if (q.is_ducklake) {
-		con.Query("INSTALL ducklake");
-		con.Query("LOAD ducklake");
-		auto at = con.Query("ATTACH IF NOT EXISTS '" + dl_path + "' AS dl (TYPE ducklake)");
+		MatQuery(con, "INSTALL ducklake");
+		MatQuery(con, "LOAD ducklake");
+		auto at = MatQuery(con, "ATTACH IF NOT EXISTS '" + dl_path + "' AS dl (TYPE ducklake)");
 		if (!at || at->HasError()) {
 			SetErr(r, "attach dl: " + (at ? at->GetError() : "null"));
 			return false;
 		}
-		auto chk = con.Query("SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog='dl' "
+		auto chk = MatQuery(con, "SELECT COUNT(*) FROM information_schema.tables WHERE table_catalog='dl' "
 		                     "AND LOWER(table_name)='warehouse'");
 		bool needs_init = !chk || chk->HasError() || chk->RowCount() == 0 ||
 		                  chk->GetValue(0, 0).GetValue<int64_t>() == 0;
 		if (needs_init) {
-			con.Query("USE dl.main");
+			MatQuery(con, "USE dl.main");
 			CreateTPCCSchema(con);
-			auto probe = con.Query("SELECT current_database()");
+			auto probe = MatQuery(con, "SELECT current_database()");
 			string native_cat = (probe && !probe->HasError() && probe->RowCount() > 0)
 			                        ? probe->GetValue(0, 0).ToString()
 			                        : "memory";
 			if (native_cat == "dl") native_cat = "memory";
 			for (const char *t : {"WAREHOUSE", "DISTRICT", "CUSTOMER", "ITEM", "STOCK", "OORDER", "NEW_ORDER",
 			                       "ORDER_LINE", "HISTORY"}) {
-				con.Query(string("INSERT INTO ") + t + " SELECT * FROM " + native_cat + ".main." + t);
+				MatQuery(con, string("INSERT INTO ") + t + " SELECT * FROM " + native_cat + ".main." + t);
 			}
 		} else {
-			con.Query("USE dl.main");
+			MatQuery(con, "USE dl.main");
 		}
 	}
 
@@ -501,14 +502,14 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 		                        "openivm_skip_projection_delete", "openivm_minmax_incremental", "openivm_having_merge",
 		                        "openivm_ducklake_nterm"};
 		for (const char *f : flags) {
-			con.Query(string("SET ") + f + " = false");
+			MatQuery(con, string("SET ") + f + " = false");
 		}
 	}
 
 	// 4. CREATE MATERIALIZED VIEW(s)
 	int64_t t0 = NowMicros();
 	for (auto &create_sql : q.create_mvs) {
-		auto cr = con.Query(create_sql);
+		auto cr = MatQuery(con, create_sql);
 		if (!cr || cr->HasError()) {
 			SetErr(r, "CREATE MV failed: " + (cr ? cr->GetError() : "null"));
 			return false;
@@ -519,13 +520,13 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 
 	// 5. Warm caches
 	for (auto &tbl : q.warm_tables) {
-		con.Query("SELECT * FROM " + tbl);
+		MatQuery(con, "SELECT * FROM " + tbl);
 		if (!q.is_ducklake) {
 			string dt = tbl;
 			auto pos = dt.find('.');
 			if (pos != string::npos) dt = dt.substr(pos + 1);
 			for (auto &ch : dt) ch = static_cast<char>(tolower(ch));
-			con.Query("SELECT * FROM delta_" + dt);
+			MatQuery(con, "SELECT * FROM delta_" + dt);
 		}
 	}
 
@@ -551,7 +552,7 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 			}
 		}
 		for (auto &s : dml) {
-			auto w = con.Query(s);
+			auto w = MatQuery(con, s);
 			if (w && !w->HasError()) issued++;
 		}
 	}
@@ -560,7 +561,7 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 	// 7. Measure refresh(es)
 	int64_t t2 = NowMicros();
 	for (auto &mv : q.refresh_mvs) {
-		auto rr = con.Query("PRAGMA refresh('" + mv + "')");
+		auto rr = MatQuery(con, "PRAGMA refresh('" + mv + "')");
 		if (!rr || rr->HasError()) {
 			SetErr(r, "PRAGMA refresh(" + mv + ") failed: " + (rr ? rr->GetError() : "null"));
 			return false;
@@ -571,7 +572,7 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 
 	// 8. MV row-count sanity
 	string last_mv = q.refresh_mvs.back();
-	auto cnt = con.Query("SELECT COUNT(*) FROM " + last_mv);
+	auto cnt = MatQuery(con, "SELECT COUNT(*) FROM " + last_mv);
 	if (cnt && !cnt->HasError() && cnt->RowCount() > 0) {
 		r.mv_rows = cnt->GetValue(0, 0).GetValue<int64_t>();
 	}
@@ -900,7 +901,7 @@ int main(int argc, char **argv) {
 				duckdb::Connection con(db);
 				CreateTPCCSchema(con);
 				InsertTPCCData(con, scale);
-				con.Query("PRAGMA checkpoint");
+				MatQuery(con, "PRAGMA checkpoint");
 			}
 			_exit(0);
 		}

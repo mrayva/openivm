@@ -143,7 +143,7 @@ static unordered_set<TableIndex> ExpressionTableIndexes(const Expression &expr) 
 }
 
 static bool ExpressionUsesOnly(const Expression &expr, const unordered_set<TableIndex> &table_indexes,
-							       bool allow_no_bindings = false) {
+                               bool allow_no_bindings = false) {
 	auto bindings = ExpressionTableIndexes(expr);
 	if (bindings.empty()) {
 		return allow_no_bindings;
@@ -191,7 +191,7 @@ static bool TryCollectSemiAntiKeyReplacement(ExpressionType comparison, const Ex
 
 static unique_ptr<Expression> BuildIsNotNull(unique_ptr<Expression> child) {
 	auto is_not_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NOT_NULL, LogicalType::BOOLEAN);
-		is_not_null->GetChildrenMutable().push_back(std::move(child));
+	is_not_null->GetChildrenMutable().push_back(std::move(child));
 	return std::move(is_not_null);
 }
 
@@ -422,7 +422,7 @@ static void CollectConvertibleMarkIndexes(LogicalOperator &op, unordered_set<Tab
 
 static bool IsConvertibleMarkPredicate(const Expression &expr, const unordered_set<TableIndex> &mark_indexes) {
 	for (auto &mark_index : mark_indexes) {
-			if (IsMarkColumnRef(expr, mark_index) || IsNotMarkColumnRef(expr, mark_index)) {
+		if (IsMarkColumnRef(expr, mark_index) || IsNotMarkColumnRef(expr, mark_index)) {
 			return true;
 		}
 	}
@@ -621,7 +621,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
 			for (idx_t i = 0; i < cols; i++) {
 				auto col_ref = make_uniq<BoundColumnRefExpression>(subtree_types[i], subtree_bindings[i]);
 				if (i < ref.bound_columns.size() && !ref.bound_columns[i].empty()) {
-		col_ref->SetAlias(Identifier(ref.bound_columns[i]));
+					col_ref->SetAlias(Identifier(ref.bound_columns[i]));
 				}
 				proj_exprs.push_back(std::move(col_ref));
 			}
@@ -855,7 +855,7 @@ static bool FoldConstantScalarSubqueriesOnce(ClientContext &context, unique_ptr<
 			D_ASSERT(value != values.end());
 			OPENIVM_DEBUG_PRINT("[PlanRewrite] Folded constant scalar subquery "
 			                    "binding (%lu.%lu) = %s\n",
-					(unsigned long)b.table_index.index, (unsigned long)b.column_index.GetIndexUnsafe(),
+			                    (unsigned long)b.table_index.index, (unsigned long)b.column_index.GetIndexUnsafe(),
 			                    value->second.ToString().c_str());
 		}
 		node = std::move(node->children[1 - side]); // keep the real input, drop the cross product
@@ -1165,13 +1165,15 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
 				bindings.found = true;
 				bindings.is_full_outer = join.join_type == JoinType::OUTER;
 
-					auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.RightReference() : condition.LeftReference();
+				auto &preserved_key =
+				    join.join_type == JoinType::RIGHT ? condition.RightReference() : condition.LeftReference();
 				ReadColumnRefBinding(preserved_key, bindings.preserved_key_binding, bindings.preserved_key_type);
-					ReadColumnRefBinding(condition.RightReference(), bindings.right_key_binding, bindings.right_key_type);
+				ReadColumnRefBinding(condition.RightReference(), bindings.right_key_binding, bindings.right_key_type);
 
-					auto &null_side = join.join_type == JoinType::RIGHT ? condition.LeftReference() : condition.RightReference();
+				auto &null_side =
+				    join.join_type == JoinType::RIGHT ? condition.LeftReference() : condition.RightReference();
 				ReadColumnRefBinding(null_side, bindings.null_side_binding, bindings.null_side_type);
-					ReadColumnRefBinding(condition.LeftReference(), bindings.left_side_binding, bindings.left_side_type);
+				ReadColumnRefBinding(condition.LeftReference(), bindings.left_side_binding, bindings.left_side_type);
 				return true;
 			}
 		}
@@ -1233,7 +1235,7 @@ static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &pla
 				}
 				auto &ref = projection.expressions[i]->Cast<BoundColumnRefExpression>();
 				if (ref.Binding() == current) {
-				current = ColumnBinding(projection.table_index, ProjectionIndex(i));
+					current = ColumnBinding(projection.table_index, ProjectionIndex(i));
 					found = true;
 					break;
 				}
@@ -1349,7 +1351,7 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
 	vector<unique_ptr<Expression>> count_args;
 	count_args.push_back(make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding));
 	auto count_expr = count_func.Bind(context, std::move(count_args));
-				count_expr->SetAlias(Identifier(openivm::MATCH_COUNT_COL));
+	count_expr->SetAlias(Identifier(openivm::MATCH_COUNT_COL));
 	idx_t match_count_idx = agg.expressions.size();
 	agg.expressions.push_back(std::move(count_expr));
 
@@ -1709,7 +1711,8 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 			return true;
 		}
 		auto projection = projections.find(column.Binding().table_index);
-		if (projection == projections.end() || column.Binding().column_index >= projection->second->expressions.size() ||
+		if (projection == projections.end() ||
+		    column.Binding().column_index >= projection->second->expressions.size() ||
 		    !active_bindings.insert(key).second) {
 			return false;
 		}
@@ -1790,8 +1793,8 @@ static bool RenderDerivedOutputExpression(const Expression &expr,
 			return false;
 		}
 		string child_sql;
-		if (!RenderDerivedOutputExpression(*op.GetChildren()[0], binding_to_column, projections, active_bindings, child_sql,
-		                                   allow_functions)) {
+		if (!RenderDerivedOutputExpression(*op.GetChildren()[0], binding_to_column, projections, active_bindings,
+		                                   child_sql, allow_functions)) {
 			return false;
 		}
 		if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
@@ -1825,7 +1828,9 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 		BoundColumnRefExpression output(LogicalType::SQLNULL, bindings[i]);
 		vector<uint64_t> path;
 		auto resolved = ResolveDerivedOutputPassThrough(output, projections, &path);
-		if (resolved && resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+		// Every binding on this pass-through path denotes the published value,
+		// including when the path ends at a computed expression.
+		if (resolved) {
 			for (auto key : path) {
 				binding_to_column[key] = output_names[i];
 			}
@@ -1844,7 +1849,7 @@ bool RenderPlanOutputExpression(const Expression &expression, LogicalOperator &p
 			auto name = entry->second;
 			vector<uint64_t> path;
 			auto resolved = ResolveDerivedOutputPassThrough(*aggregate->groups[i], projections, &path);
-			if (resolved && resolved->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+			if (resolved) {
 				for (auto input_key : path) {
 					binding_to_column[input_key] = name;
 				}
@@ -2159,9 +2164,8 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 			}
 			string hidden_name = "openivm_having_" + std::to_string(next_hidden++);
 			auto col_type = agg_child.expressions[b.second]->GetReturnType();
-			auto hidden_expr =
-				    make_uniq<BoundColumnRefExpression>(Identifier(hidden_name), col_type,
-				                                       ColumnBinding(b.first, b.second));
+			auto hidden_expr = make_uniq<BoundColumnRefExpression>(Identifier(hidden_name), col_type,
+			                                                       ColumnBinding(b.first, b.second));
 			hidden_expr->SetAlias(Identifier(hidden_name));
 			proj_ptr->expressions.push_back(std::move(hidden_expr));
 			output_names.push_back(hidden_name);
@@ -2190,7 +2194,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 				for (idx_t i = hidden_start_idx; i < proj_ptr->expressions.size(); i++) {
 					carried.push_back({ColumnBinding(proj_ptr->table_index, ProjectionIndex(i)),
 					                   proj_ptr->expressions[i]->GetReturnType(),
-					   proj_ptr->expressions[i]->GetName().GetIdentifierName()});
+					                   proj_ptr->expressions[i]->GetName().GetIdentifierName()});
 				}
 				for (idx_t level = proj_chain.size() - 1; level-- > 0;) {
 					auto *upper = proj_chain[level];
@@ -2199,7 +2203,8 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
 						auto ref = make_uniq<BoundColumnRefExpression>(Identifier(c.name), c.type, c.binding);
 						ref->SetAlias(Identifier(c.name));
 						next_carried.push_back(
-				    {ColumnBinding(upper->table_index, ProjectionIndex(upper->expressions.size())), c.type, c.name});
+						    {ColumnBinding(upper->table_index, ProjectionIndex(upper->expressions.size())), c.type,
+						     c.name});
 						upper->expressions.push_back(std::move(ref));
 					}
 					upper->ResolveOperatorTypes();

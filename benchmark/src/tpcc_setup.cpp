@@ -1,3 +1,4 @@
+#include "core/materialized_result.hpp"
 #include <duckdb.hpp>
 #include <iostream>
 #include <fstream>
@@ -38,17 +39,17 @@ public:
 	void CreateSchema() {
 		Log("Creating TPC-C schema...");
 
-		conn.Query("DROP TABLE IF EXISTS ORDER_LINE");
-		conn.Query("DROP TABLE IF EXISTS STOCK");
-		conn.Query("DROP TABLE IF EXISTS ITEM");
-		conn.Query("DROP TABLE IF EXISTS HISTORY");
-		conn.Query("DROP TABLE IF EXISTS NEW_ORDER");
-		conn.Query("DROP TABLE IF EXISTS OORDER");
-		conn.Query("DROP TABLE IF EXISTS CUSTOMER");
-		conn.Query("DROP TABLE IF EXISTS DISTRICT");
-		conn.Query("DROP TABLE IF EXISTS WAREHOUSE");
+		MatQuery(conn, "DROP TABLE IF EXISTS ORDER_LINE");
+		MatQuery(conn, "DROP TABLE IF EXISTS STOCK");
+		MatQuery(conn, "DROP TABLE IF EXISTS ITEM");
+		MatQuery(conn, "DROP TABLE IF EXISTS HISTORY");
+		MatQuery(conn, "DROP TABLE IF EXISTS NEW_ORDER");
+		MatQuery(conn, "DROP TABLE IF EXISTS OORDER");
+		MatQuery(conn, "DROP TABLE IF EXISTS CUSTOMER");
+		MatQuery(conn, "DROP TABLE IF EXISTS DISTRICT");
+		MatQuery(conn, "DROP TABLE IF EXISTS WAREHOUSE");
 
-		conn.Query(R"(CREATE TABLE WAREHOUSE (
+		MatQuery(conn, R"(CREATE TABLE WAREHOUSE (
 			W_ID INT NOT NULL PRIMARY KEY,
 			W_YTD DECIMAL(12, 2) NOT NULL,
 			W_TAX DECIMAL(4, 4) NOT NULL,
@@ -57,7 +58,7 @@ public:
 			W_CITY VARCHAR(20), W_STATE CHAR(2), W_ZIP CHAR(9)
 		))");
 
-		conn.Query(R"(CREATE TABLE DISTRICT (
+		MatQuery(conn, R"(CREATE TABLE DISTRICT (
 			D_W_ID INT NOT NULL, D_ID INT NOT NULL,
 			D_YTD DECIMAL(12, 2), D_TAX DECIMAL(4, 4),
 			D_NEXT_O_ID INT NOT NULL,
@@ -67,7 +68,7 @@ public:
 			FOREIGN KEY (D_W_ID) REFERENCES WAREHOUSE(W_ID)
 		))");
 
-		conn.Query(R"(CREATE TABLE CUSTOMER (
+		MatQuery(conn, R"(CREATE TABLE CUSTOMER (
 			C_W_ID INT NOT NULL, C_D_ID INT NOT NULL, C_ID INT NOT NULL,
 			C_DISCOUNT DECIMAL(4, 4), C_CREDIT CHAR(2),
 			C_LAST VARCHAR(16), C_FIRST VARCHAR(16),
@@ -81,13 +82,13 @@ public:
 			FOREIGN KEY (C_W_ID, C_D_ID) REFERENCES DISTRICT(D_W_ID, D_ID)
 		))");
 
-		conn.Query(R"(CREATE TABLE ITEM (
+		MatQuery(conn, R"(CREATE TABLE ITEM (
 			I_ID INT NOT NULL PRIMARY KEY,
 			I_NAME VARCHAR(24), I_PRICE DECIMAL(5, 2),
 			I_DATA VARCHAR(50), I_IM_ID INT
 		))");
 
-		conn.Query(R"(CREATE TABLE STOCK (
+		MatQuery(conn, R"(CREATE TABLE STOCK (
 			S_W_ID INT NOT NULL, S_I_ID INT NOT NULL,
 			S_QUANTITY INT, S_YTD DECIMAL(8, 2),
 			S_ORDER_CNT INT, S_REMOTE_CNT INT, S_DATA VARCHAR(50),
@@ -99,7 +100,7 @@ public:
 			FOREIGN KEY (S_I_ID) REFERENCES ITEM(I_ID)
 		))");
 
-		conn.Query(R"(CREATE TABLE OORDER (
+		MatQuery(conn, R"(CREATE TABLE OORDER (
 			O_W_ID INT NOT NULL, O_D_ID INT NOT NULL, O_ID INT NOT NULL,
 			O_C_ID INT NOT NULL, O_CARRIER_ID INT,
 			O_OL_CNT INT, O_ALL_LOCAL INT, O_ENTRY_D TIMESTAMP,
@@ -107,13 +108,13 @@ public:
 			FOREIGN KEY (O_W_ID, O_D_ID, O_C_ID) REFERENCES CUSTOMER(C_W_ID, C_D_ID, C_ID)
 		))");
 
-		conn.Query(R"(CREATE TABLE NEW_ORDER (
+		MatQuery(conn, R"(CREATE TABLE NEW_ORDER (
 			NO_W_ID INT, NO_D_ID INT, NO_O_ID INT,
 			PRIMARY KEY (NO_W_ID, NO_D_ID, NO_O_ID),
 			FOREIGN KEY (NO_W_ID, NO_D_ID, NO_O_ID) REFERENCES OORDER(O_W_ID, O_D_ID, O_ID)
 		))");
 
-		conn.Query(R"(CREATE TABLE ORDER_LINE (
+		MatQuery(conn, R"(CREATE TABLE ORDER_LINE (
 			OL_W_ID INT, OL_D_ID INT, OL_O_ID INT, OL_NUMBER INT,
 			OL_I_ID INT, OL_DELIVERY_D TIMESTAMP,
 			OL_AMOUNT DECIMAL(6, 2), OL_SUPPLY_W_ID INT, OL_QUANTITY DECIMAL(6, 2),
@@ -123,7 +124,7 @@ public:
 			FOREIGN KEY (OL_SUPPLY_W_ID, OL_I_ID) REFERENCES STOCK(S_W_ID, S_I_ID)
 		))");
 
-		conn.Query(R"(CREATE TABLE HISTORY (
+		MatQuery(conn, R"(CREATE TABLE HISTORY (
 			H_C_ID INT, H_C_D_ID INT, H_C_W_ID INT,
 			H_D_ID INT, H_W_ID INT, H_DATE TIMESTAMP,
 			H_AMOUNT DECIMAL(6, 2), H_DATA VARCHAR(24),
@@ -152,7 +153,7 @@ public:
 		for (int w = 1; w <= num_warehouses; ++w) {
 			std::string sql = "INSERT INTO WAREHOUSE VALUES (" + std::to_string(w) +
 							  ", 300000.00, 0.1, 'Warehouse', 'S1', 'S2', 'City', 'CA', '12345')";
-			conn.Query(sql);
+			MatQuery(conn, sql);
 			total_warehouses++;
 		}
 		Log("    Warehouses: " + std::to_string(total_warehouses));
@@ -165,7 +166,7 @@ public:
 			item_sql += "(" + std::to_string(i) + ", 'Item" + std::to_string(i) + "', 50.00, 'Data', " +
 					   std::to_string(i % 1000) + ")";
 		}
-		conn.Query(item_sql);
+		MatQuery(conn, item_sql);
 		Log("    Items: " + std::to_string(total_items));
 
 		// Districts, Customers, Stock, Orders
@@ -174,7 +175,7 @@ public:
 				// District
 				std::string dist_sql = "INSERT INTO DISTRICT VALUES (" + std::to_string(w) + ", " +
 									   std::to_string(d) + ", 30000.00, 0.1, 11, 'District', 'S1', 'S2', 'City', 'CA', '12345')";
-				conn.Query(dist_sql);
+				MatQuery(conn, dist_sql);
 				total_districts++;
 
 				// Customers
@@ -183,7 +184,7 @@ public:
 										  std::to_string(w) + ", " + std::to_string(d) + ", " + std::to_string(c) +
 										  ", 0.15, 'GC', 'LastName', 'FirstName', 50000.00, -5000.00, 0.0, 0, 0, " +
 										  "'S1', 'S2', 'City', 'CA', '12345', '1234567890', NOW(), 'MI', 'Data')";
-					conn.Query(cust_sql);
+					MatQuery(conn, cust_sql);
 					total_customers++;
 				}
 
@@ -192,7 +193,7 @@ public:
 					std::string stock_sql = "INSERT INTO STOCK VALUES (" +
 										   std::to_string(w) + ", " + std::to_string(i) + ", 50, 0.0, 0, 0, 'StockData', " +
 										   "'D01', 'D02', 'D03', 'D04', 'D05', 'D06', 'D07', 'D08', 'D09', 'D10')";
-					conn.Query(stock_sql);
+					MatQuery(conn, stock_sql);
 					total_stock++;
 				}
 
@@ -202,7 +203,7 @@ public:
 					std::string order_sql = "INSERT INTO OORDER VALUES (" +
 										   std::to_string(w) + ", " + std::to_string(d) + ", " + std::to_string(o) + ", " +
 										   std::to_string(c) + ", NULL, 5, 1, NOW())";
-					conn.Query(order_sql);
+					MatQuery(conn, order_sql);
 					total_orders++;
 
 					// Order Lines
@@ -212,7 +213,7 @@ public:
 											std::to_string(w) + ", " + std::to_string(d) + ", " + std::to_string(o) + ", " +
 											std::to_string(ol) + ", " + std::to_string(i) + ", NULL, 100.00, " +
 											std::to_string(w) + ", 5, 'DistInfo')";
-						conn.Query(ol_sql);
+						MatQuery(conn, ol_sql);
 						total_orderlines++;
 					}
 				}
@@ -221,7 +222,7 @@ public:
 				for (int o = 1; o <= 10; o += 3) {
 					std::string norder_sql = "INSERT INTO NEW_ORDER VALUES (" +
 											std::to_string(w) + ", " + std::to_string(d) + ", " + std::to_string(o) + ")";
-					conn.Query(norder_sql);
+					MatQuery(conn, norder_sql);
 					total_neworders++;
 				}
 			}
@@ -247,9 +248,9 @@ public:
 		Log("Simulating " + std::to_string(num_tx) + " OLTP transactions...");
 
 		// Get warehouse/district/customer info safely
-		auto wres = conn.Query("SELECT COUNT(DISTINCT W_ID) FROM WAREHOUSE");
+		auto wres = MatQuery(conn, "SELECT COUNT(DISTINCT W_ID) FROM WAREHOUSE");
 		auto dcount = 10;
-		auto cres = conn.Query("SELECT COUNT(DISTINCT C_ID) FROM CUSTOMER");
+		auto cres = MatQuery(conn, "SELECT COUNT(DISTINCT C_ID) FROM CUSTOMER");
 
 		if (wres->RowCount() == 0 || cres->RowCount() == 0) {
 			Log("Error: No warehouses or customers generated. Skipping transactions.");
@@ -280,7 +281,7 @@ public:
 								  ", C_PAYMENT_CNT = C_PAYMENT_CNT + 1 WHERE C_W_ID = " +
 								  std::to_string(w) + " AND C_D_ID = " + std::to_string(d) +
 								  " AND C_ID = " + std::to_string(c);
-				conn.Query(sql);
+				MatQuery(conn, sql);
 				deltas.push_back(sql);
 
 			} else if (tx_type == 1) {
@@ -288,7 +289,7 @@ public:
 				int item_id = ((i % 100) + 1);
 				std::string sql = std::string("UPDATE STOCK SET S_QUANTITY = S_QUANTITY - 5, S_ORDER_CNT = S_ORDER_CNT + 1 ") +
 								  "WHERE S_W_ID = " + std::to_string(w) + " AND S_I_ID = " + std::to_string(item_id);
-				conn.Query(sql);
+				MatQuery(conn, sql);
 				deltas.push_back(sql);
 
 			} else {
@@ -299,7 +300,7 @@ public:
 								  "WHERE OL_W_ID = " + std::to_string(w) + " AND OL_D_ID = " +
 								  std::to_string(d) + " AND OL_O_ID = " + std::to_string(order_id) +
 								  " AND OL_NUMBER = " + std::to_string(ol_number);
-				conn.Query(sql);
+				MatQuery(conn, sql);
 				deltas.push_back(sql);
 			}
 
@@ -318,7 +319,7 @@ public:
 		Log("Verifying data integrity...");
 
 		auto GetCount = [this](const std::string &table) {
-			return conn.Query("SELECT COUNT(*) FROM " + table)->GetValue(0, 0).GetValue<int64_t>();
+			return MatQuery(conn, "SELECT COUNT(*) FROM " + table)->GetValue(0, 0).GetValue<int64_t>();
 		};
 
 		Log("Final row counts:");

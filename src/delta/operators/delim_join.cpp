@@ -293,8 +293,7 @@ static ColumnBinding FindOutputBinding(const vector<ColumnBinding> &term_binding
 		if (!candidates.empty()) {
 			candidates += ", ";
 		}
-		candidates += to_string(binding.table_index.index) + ":" +
-		              to_string(binding.column_index.GetIndexUnsafe());
+		candidates += to_string(binding.table_index.index) + ":" + to_string(binding.column_index.GetIndexUnsafe());
 	}
 	throw InternalException("DeltaDelimJoin: original output binding %llu:%llu not found in rewritten term [%s]",
 	                        target.table_index.index, target.column_index.GetIndexUnsafe(), candidates.c_str());

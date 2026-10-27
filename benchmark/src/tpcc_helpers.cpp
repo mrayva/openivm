@@ -1,3 +1,4 @@
+#include "core/materialized_result.hpp"
 #include "tpcc_helpers.hpp"
 
 #include "duckdb/common/printer.hpp"
@@ -57,29 +58,29 @@ bool FileExists(const std::string &path) {
 }
 
 void CreateTPCCSchema(duckdb::Connection &con) {
-	con.Query("CREATE TABLE WAREHOUSE (W_ID INT, W_YTD DECIMAL(12, 2), W_TAX DECIMAL(4, 4), W_NAME VARCHAR(10), "
+	MatQuery(con, "CREATE TABLE WAREHOUSE (W_ID INT, W_YTD DECIMAL(12, 2), W_TAX DECIMAL(4, 4), W_NAME VARCHAR(10), "
 	          "W_STREET_1 VARCHAR(20), W_STREET_2 VARCHAR(20), W_CITY VARCHAR(20), W_STATE CHAR(2), W_ZIP CHAR(9))");
-	con.Query("CREATE TABLE DISTRICT (D_W_ID INT, D_ID INT, D_YTD DECIMAL(12, 2), D_TAX DECIMAL(4, 4), D_NEXT_O_ID "
+	MatQuery(con, "CREATE TABLE DISTRICT (D_W_ID INT, D_ID INT, D_YTD DECIMAL(12, 2), D_TAX DECIMAL(4, 4), D_NEXT_O_ID "
 	          "INT, D_NAME VARCHAR(10), D_STREET_1 VARCHAR(20), D_STREET_2 VARCHAR(20), D_CITY VARCHAR(20), D_STATE "
 	          "CHAR(2), D_ZIP CHAR(9))");
-	con.Query("CREATE TABLE CUSTOMER (C_W_ID INT, C_D_ID INT, C_ID INT, C_DISCOUNT DECIMAL(4, 4), C_CREDIT CHAR(2), "
+	MatQuery(con, "CREATE TABLE CUSTOMER (C_W_ID INT, C_D_ID INT, C_ID INT, C_DISCOUNT DECIMAL(4, 4), C_CREDIT CHAR(2), "
 	          "C_LAST VARCHAR(16), C_FIRST VARCHAR(16), C_CREDIT_LIM DECIMAL(12, 2), C_BALANCE DECIMAL(12, 2), "
 	          "C_YTD_PAYMENT FLOAT, C_PAYMENT_CNT INT, C_DELIVERY_CNT INT, C_STREET_1 VARCHAR(20), C_STREET_2 "
 	          "VARCHAR(20), C_CITY VARCHAR(20), C_STATE CHAR(2), C_ZIP CHAR(9), C_PHONE CHAR(16), C_SINCE TIMESTAMP, "
 	          "C_MIDDLE CHAR(2), C_DATA VARCHAR(500))");
-	con.Query("CREATE TABLE ITEM (I_ID INT, I_NAME VARCHAR(24), I_PRICE DECIMAL(5, 2), I_DATA VARCHAR(50), I_IM_ID "
+	MatQuery(con, "CREATE TABLE ITEM (I_ID INT, I_NAME VARCHAR(24), I_PRICE DECIMAL(5, 2), I_DATA VARCHAR(50), I_IM_ID "
 	          "INT)");
-	con.Query("CREATE TABLE STOCK (S_W_ID INT, S_I_ID INT, S_QUANTITY INT, S_YTD DECIMAL(8, 2), S_ORDER_CNT INT, "
+	MatQuery(con, "CREATE TABLE STOCK (S_W_ID INT, S_I_ID INT, S_QUANTITY INT, S_YTD DECIMAL(8, 2), S_ORDER_CNT INT, "
 	          "S_REMOTE_CNT INT, S_DATA VARCHAR(50), S_DIST_01 CHAR(24), S_DIST_02 CHAR(24), S_DIST_03 CHAR(24), "
 	          "S_DIST_04 CHAR(24), S_DIST_05 CHAR(24), S_DIST_06 CHAR(24), S_DIST_07 CHAR(24), S_DIST_08 CHAR(24), "
 	          "S_DIST_09 CHAR(24), S_DIST_10 CHAR(24))");
-	con.Query("CREATE TABLE OORDER (O_W_ID INT, O_D_ID INT, O_ID INT, O_C_ID INT, O_CARRIER_ID INT, O_OL_CNT INT, "
+	MatQuery(con, "CREATE TABLE OORDER (O_W_ID INT, O_D_ID INT, O_ID INT, O_C_ID INT, O_CARRIER_ID INT, O_OL_CNT INT, "
 	          "O_ALL_LOCAL INT, O_ENTRY_D TIMESTAMP)");
-	con.Query("CREATE TABLE NEW_ORDER (NO_W_ID INT, NO_D_ID INT, NO_O_ID INT)");
-	con.Query("CREATE TABLE ORDER_LINE (OL_W_ID INT, OL_D_ID INT, OL_O_ID INT, OL_NUMBER INT, OL_I_ID INT, "
+	MatQuery(con, "CREATE TABLE NEW_ORDER (NO_W_ID INT, NO_D_ID INT, NO_O_ID INT)");
+	MatQuery(con, "CREATE TABLE ORDER_LINE (OL_W_ID INT, OL_D_ID INT, OL_O_ID INT, OL_NUMBER INT, OL_I_ID INT, "
 	          "OL_DELIVERY_D TIMESTAMP, OL_AMOUNT DECIMAL(6, 2), OL_SUPPLY_W_ID INT, OL_QUANTITY DECIMAL(6, 2), "
 	          "OL_DIST_INFO CHAR(24))");
-	con.Query("CREATE TABLE HISTORY (H_C_ID INT, H_C_D_ID INT, H_C_W_ID INT, H_D_ID INT, H_W_ID INT, H_DATE "
+	MatQuery(con, "CREATE TABLE HISTORY (H_C_ID INT, H_C_D_ID INT, H_C_W_ID INT, H_D_ID INT, H_W_ID INT, H_DATE "
 	          "TIMESTAMP, H_AMOUNT DECIMAL(6, 2), H_DATA VARCHAR(24))");
 }
 
@@ -115,24 +116,24 @@ void InsertTPCCData(duckdb::Connection &con, int scale_factor, TPCCScaleProfile 
 	auto OL = std::to_string(order_lines_per_order + 1);
 	auto I = std::to_string(num_items + 1);
 
-	con.Query("INSERT INTO WAREHOUSE SELECT w, 300000.00, 0.0500, 'WH'||w, 'Street1', 'Street2', 'City', 'ST', "
+	MatQuery(con, "INSERT INTO WAREHOUSE SELECT w, 300000.00, 0.0500, 'WH'||w, 'Street1', 'Street2', 'City', 'ST', "
 	          "'123456789' FROM range(1, " +
 	          N + ") t(w)");
-	con.Query("INSERT INTO DISTRICT SELECT w, d, 30000.00, 0.0500, 1, 'D'||d, 'Street1', 'Street2', 'City', 'ST', "
+	MatQuery(con, "INSERT INTO DISTRICT SELECT w, d, 30000.00, 0.0500, 1, 'D'||d, 'Street1', 'Street2', 'City', 'ST', "
 	          "'123456789' FROM range(1, " +
 	          N + ") t(w), range(1, " + D + ") g(d)");
-	con.Query("INSERT INTO CUSTOMER SELECT w, d, c, 0.05, 'GC', 'LastName', 'FirstName', 50000.00, 10000.00, 0.0, 0, "
+	MatQuery(con, "INSERT INTO CUSTOMER SELECT w, d, c, 0.05, 'GC', 'LastName', 'FirstName', 50000.00, 10000.00, 0.0, 0, "
 	          "0, 'St1', 'St2', 'City', 'ST', '123456789', '1234567890123456', NOW(), 'M', 'data' FROM range(1, " +
 	          N + ") t(w), range(1, " + D + ") g(d), range(1, " + C + ") cc(c)");
-	con.Query("INSERT INTO ITEM SELECT i, 'Item'||i, (10 + (i % 90)) + 0.99, 'ItemData', (i % 10) + 1 FROM range(1, " +
+	MatQuery(con, "INSERT INTO ITEM SELECT i, 'Item'||i, (10 + (i % 90)) + 0.99, 'ItemData', (i % 10) + 1 FROM range(1, " +
 	          I + ") t(i)");
-	con.Query("INSERT INTO STOCK SELECT w, i, 50 + (i % 50), 0.00, 0, 0, 'StockData', 'Dist1', 'Dist2', 'Dist3', "
+	MatQuery(con, "INSERT INTO STOCK SELECT w, i, 50 + (i % 50), 0.00, 0, 0, 'StockData', 'Dist1', 'Dist2', 'Dist3', "
 	          "'Dist4', 'Dist5', 'Dist6', 'Dist7', 'Dist8', 'Dist9', 'Dist10' FROM range(1, " +
 	          N + ") t(w), range(1, " + I + ") g(i)");
-	con.Query("INSERT INTO OORDER SELECT w, d, o, (o % " + C +
+	MatQuery(con, "INSERT INTO OORDER SELECT w, d, o, (o % " + C +
 	          ") + 1, NULL, 5, 1, NOW() FROM range(1, " + N + ") t(w), range(1, " + D + ") g(d), range(1, " + O +
 	          ") oo(o)");
-	con.Query("INSERT INTO ORDER_LINE SELECT w, d, o, ol, (ol % 10) + 1, NULL, (10 + ol * 5) + 0.00, w, 5.00, "
+	MatQuery(con, "INSERT INTO ORDER_LINE SELECT w, d, o, ol, (ol % 10) + 1, NULL, (10 + ol * 5) + 0.00, w, 5.00, "
 	          "'DistInfo' FROM range(1, " +
 	          N + ") t(w), range(1, " + D + ") g(d), range(1, " + O + ") oo(o), range(1, " + OL + ") l(ol)");
 }

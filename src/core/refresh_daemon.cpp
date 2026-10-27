@@ -105,7 +105,11 @@ void RefreshDaemon::Run() {
 					break;
 				}
 
-				RefreshMetadata::UseCatalog(*con.context, con, sv.metadata_catalog);
+				// Cascade lookups below read the location that registered this view.
+				MetadataLocation location;
+				location.catalog = sv.metadata_catalog;
+				location.schema = sv.metadata_schema;
+				MetadataLocator::Use(con, location);
 				auto view_key = SqlUtils::FullName(sv.catalog_name, sv.schema_name, sv.view_name);
 
 				// Skip if already refreshed via cascade from an earlier view in this cycle
@@ -125,9 +129,8 @@ void RefreshDaemon::Run() {
 
 				// Check if the view is due for refresh
 				if (!sv.last_update.empty()) {
-					auto elapsed_result = con.Query("SELECT EXTRACT(EPOCH FROM (" + string(openivm::UTC_NOW_SQL) + " - '" +
-					                                sv.last_update +
-					                                "'::TIMESTAMP))");
+					auto elapsed_result = MatQuery(con, "SELECT EXTRACT(EPOCH FROM (" + string(openivm::UTC_NOW_SQL) +
+					                                        " - '" + sv.last_update + "'::TIMESTAMP))");
 					if (!elapsed_result->HasError() && elapsed_result->RowCount() > 0 &&
 					    !elapsed_result->GetValue(0, 0).IsNull()) {
 						auto elapsed_seconds = elapsed_result->GetValue(0, 0).GetValue<double>();
@@ -148,9 +151,10 @@ void RefreshDaemon::Run() {
 				bool refresh_succeeded = false;
 				try {
 					Connection refresh_con(*db);
-					auto result = refresh_con.Query(
-					    "PRAGMA refresh_options('" + SqlUtils::EscapeValue(sv.catalog_name) + "', '" +
-					    SqlUtils::EscapeValue(sv.schema_name) + "', '" + SqlUtils::EscapeValue(sv.view_name) + "')");
+					auto result =
+					    MatQuery(refresh_con, "PRAGMA refresh_options('" + SqlUtils::EscapeValue(sv.catalog_name) +
+					                              "', '" + SqlUtils::EscapeValue(sv.schema_name) + "', '" +
+					                              SqlUtils::EscapeValue(sv.view_name) + "')");
 					if (result->HasError()) {
 						Printer::Print("Warning: auto-refresh of '" + sv.view_name + "' failed: " + result->GetError());
 					} else {

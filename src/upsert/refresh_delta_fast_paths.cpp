@@ -54,8 +54,8 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
 	// `ducklake_snapshots().changes` is a cheap catalog-level manifest keyed by DuckLake table id.
 	// It lets us skip unrelated catalog snapshots without opening table_insertions/deletions.
 	// Structural changes invalidate row-level deltas, so they force a full recompute.
-	auto result = con.Query(BuildDuckLakeSnapshotActivitySQL(catalog_name, identity.current_table_id, last_snapshot_id,
-	                                                         current_snapshot_id));
+	auto result = MatQuery(con, BuildDuckLakeSnapshotActivitySQL(catalog_name, identity.current_table_id,
+	                                                             last_snapshot_id, current_snapshot_id));
 	if (result->HasError() || result->RowCount() == 0) {
 		return activity;
 	}
@@ -67,6 +67,44 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
 	activity.has_changes = has_inserts || has_deletes || has_structural;
 	activity.has_deletes = has_deletes || has_structural;
 	activity.requires_full_refresh = has_structural;
+	return activity;
+}
+
+DuckLakeTableActivity ProbeDuckLakeTableChanges(Connection &con, const DuckLakeSourceLocation &loc, int64_t table_id,
+                                                int64_t after_snapshot_id, int64_t through_snapshot_id) {
+	DuckLakeTableActivity activity;
+	if (after_snapshot_id < 0 || through_snapshot_id < after_snapshot_id) {
+		return activity;
+	}
+	if (after_snapshot_id == through_snapshot_id) {
+		activity.ok = true;
+		return activity;
+	}
+	if (table_id >= 0) {
+		// The manifest also reports ALTER and DROP, and a recreated table drops the old id.
+		auto sql = BuildDuckLakeSnapshotActivitySQL(loc.catalog_name, table_id, after_snapshot_id, through_snapshot_id);
+		auto result = MatQuery(con, sql);
+		if (!result->HasError() && result->RowCount() == 1) {
+			activity.ok = true;
+			for (idx_t col = 0; col < 3; col++) {
+				auto changed = result->GetValue(col, 0);
+				activity.has_changes = activity.has_changes || (!changed.IsNull() && changed.GetValue<bool>());
+			}
+			return activity;
+		}
+	}
+	// Row-level fallback; change scans include their start snapshot.
+	string insertions = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+	                                                    loc.table_name, after_snapshot_id + 1, through_snapshot_id);
+	string deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+	                                                   loc.table_name, after_snapshot_id + 1, through_snapshot_id);
+	string count_sql = "SELECT (SELECT COUNT(*) FROM " + insertions + ") + (SELECT COUNT(*) FROM " + deletions + ")";
+	auto counts = MatQuery(con, count_sql);
+	if (counts->HasError() || counts->RowCount() != 1 || counts->GetValue(0, 0).IsNull()) {
+		return activity;
+	}
+	activity.ok = true;
+	activity.has_changes = counts->GetValue(0, 0).GetValue<int64_t>() > 0;
 	return activity;
 }
 
@@ -130,7 +168,7 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 	string deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
 	                                                   loc.table_name, last_snap, cur_snap);
 	auto count_result =
-	    con.Query("SELECT (SELECT COUNT(*) FROM " + insertions + "), (SELECT COUNT(*) FROM " + deletions + ")");
+	    MatQuery(con, "SELECT (SELECT COUNT(*) FROM " + insertions + "), (SELECT COUNT(*) FROM " + deletions + ")");
 	if (count_result->HasError()) {
 		source.has_changes = true;
 		source.has_deletes = true;

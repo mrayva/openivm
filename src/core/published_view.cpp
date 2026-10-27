@@ -19,9 +19,8 @@ bool IsSnapshotPublication(ClientContext &context, const string &catalog, const 
                            const string &view_name) {
 	bool snapshot_publication = false;
 	auto lookup = [&]() {
-		EntryLookupInfo lookup_info(
-		    CatalogType::VIEW_ENTRY,
-		    QualifiedName(Identifier(catalog), Identifier(schema), Identifier(PublishedViewName(view_name))));
+		EntryLookupInfo lookup_info(CatalogType::VIEW_ENTRY, QualifiedName(Identifier(catalog), Identifier(schema),
+		                                                                   Identifier(PublishedViewName(view_name))));
 		auto entry = Catalog::GetEntry(context, lookup_info, OnEntryNotFound::RETURN_NULL);
 		snapshot_publication = entry && entry->type == CatalogType::VIEW_ENTRY;
 	};
@@ -41,7 +40,8 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 		return;
 	}
 	auto &get = plan.Cast<LogicalGet>();
-	if (get.function.name != "ducklake_expire_snapshots" && get.function.name != "ducklake_cleanup_old_files") {
+	if (get.function.GetName().GetIdentifierName() != "ducklake_expire_snapshots" &&
+	    get.function.GetName().GetIdentifierName() != "ducklake_cleanup_old_files") {
 		return;
 	}
 	auto dry_run = get.named_parameters.find("dry_run");
@@ -52,24 +52,32 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 	auto catalog = get.parameters[0].ToString();
 	Connection con(*context.db);
 	vector<string> affected;
-	for (auto &metadata_catalog : RefreshMetadata::MetadataCatalogs(con)) {
-		auto views = con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name) FROM " +
-		                       SqlUtils::QualifiedPrefix(metadata_catalog, DEFAULT_SCHEMA) + openivm::VIEWS_TABLE +
-		                       " WHERE lower(view_catalog) = lower('" + SqlUtils::EscapeValue(catalog) + "')");
+	for (auto &views_table : RefreshMetadata::MetadataTables(con, openivm::VIEWS_TABLE)) {
+		// Publications live in the MV's internal location; report the user-facing name.
+		auto query = [&](const string &internal_expression) {
+			return MatQuery(con, "SELECT view_name, view_schema, COALESCE(view_sql_name, view_name), " +
+			                         internal_expression + " FROM " + views_table + " WHERE " +
+			                         SqlUtils::IdentifierEqualsSQL("view_catalog", Value(catalog).ToSQLString()));
+		};
+		auto views = query("COALESCE(internal_schema, view_schema)");
+		if (views->HasError()) {
+			views = query("view_schema"); // Metadata written before internal schemas existed.
+		}
 		if (views->HasError()) {
 			throw CatalogException("Could not check snapshot publication before history deletion: %s",
 			                       views->GetError());
 		}
 		for (idx_t row = 0; row < views->RowCount(); row++) {
 			auto schema = views->GetValue(1, row).ToString();
-			if (IsSnapshotPublication(context, catalog, schema, views->GetValue(0, row).ToString())) {
+			auto internal_schema = views->GetValue(3, row).ToString();
+			if (IsSnapshotPublication(context, catalog, internal_schema, views->GetValue(0, row).ToString())) {
 				affected.push_back(SqlUtils::FullName(catalog, schema, views->GetValue(2, row).ToString()));
 			}
 		}
 	}
 	if (!affected.empty()) {
 		Printer::Print(
-		    "Warning: " + get.function.name + " on " + SqlUtils::QuoteIdentifier(catalog) +
+		    "Warning: " + get.function.GetName().GetIdentifierName() + " on " + SqlUtils::QuoteIdentifier(catalog) +
 		    " may delete snapshot history required by OpenIVM materialized views: " + StringUtil::Join(affected, ", ") +
 		    ". Retain their pinned snapshots; deleting them can break reads. This operation is not blocked.");
 	}
@@ -82,8 +90,8 @@ string BuildSnapshotPublicationSQL(Connection &con, const string &catalog, const
 	// unchanged.
 	auto quoted_catalog = SqlUtils::QuoteIdentifier(catalog);
 	auto snapshot =
-	    con.Query("SELECT COALESCE((SELECT id FROM " + quoted_catalog +
-	              ".last_committed_snapshot()), (SELECT id FROM " + quoted_catalog + ".current_snapshot()))");
+	    MatQuery(con, "SELECT COALESCE((SELECT id FROM " + quoted_catalog +
+	                      ".last_committed_snapshot()), (SELECT id FROM " + quoted_catalog + ".current_snapshot()))");
 	if (snapshot->HasError() || snapshot->RowCount() != 1 || snapshot->GetValue(0, 0).IsNull()) {
 		throw CatalogException("Could not resolve committed snapshot for publication '%s'", published);
 	}
@@ -112,13 +120,27 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
                            const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
                            const string &appended_rows, const string &scope_rows,
-                           const vector<string> &metadata_catalogs) {
+                           const vector<string> &delta_metadata_tables) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
 	auto visible = prefix + quote(PublishedViewName(view_name));
 	auto delta_name = SqlUtils::DeltaName(PublishedViewName(view_name));
 	auto delta = prefix + quote(delta_name);
+	auto consumers = RefreshMetadata::BuildDeltaConsumersSQL(delta, delta_name, metadata_table, delta_metadata_tables);
+	// now() is frozen for a whole transaction, so a second publication in the same transaction would be
+	// stamped at or below the watermark a consumer recorded after the first one and be skipped. Keep the
+	// stamp strictly above every consumer watermark.
+	auto publish_timestamp = [&]() {
+		if (!timestamp_sql.empty()) {
+			return timestamp_sql;
+		}
+		string now = openivm::UTC_NOW_SQL;
+		return "(SELECT CASE WHEN marks.floor_ts > marks.now_ts THEN marks.floor_ts ELSE marks.now_ts END FROM "
+		       "(SELECT " +
+		       now + " AS now_ts, (SELECT MAX(last_update) + INTERVAL '1 microsecond' FROM (" + consumers +
+		       ") consumer_marks) AS floor_ts) marks)";
+	};
 	auto next = (dialect == SqlDialect::SPARK ? prefix : "") + quote("openivm_publish_next_" + view_name);
 	auto changes = (dialect == SqlDialect::SPARK ? prefix : "") + quote("openivm_publish_changes_" + view_name);
 	vector<string> quoted_columns;
@@ -138,12 +160,12 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		auto rows = "SELECT " + StringUtil::Join(projection, ", ") + " FROM (" + appended_rows + ") appended_rows";
 		string sql = "INSERT INTO " + visible + " " + rows + ";\n";
 		if (!ducklake) {
-			auto timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
+			auto timestamp = publish_timestamp();
 			sql += "INSERT INTO " + delta + " (" + column_list +
 			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
-			       ") published_rows WHERE EXISTS (SELECT 1 FROM " + metadata_table + " WHERE table_name = '" +
-			       SqlUtils::EscapeValue(delta_name) + "');\n";
-			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
+			       ") published_rows WHERE EXISTS (" + consumers + ");\n";
+			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr,
+			                                             delta_metadata_tables);
 		}
 		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
 		return sql;
@@ -188,7 +210,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	       ") old_rows UNION ALL SELECT *, CAST(1 AS BIGINT) FROM " + next + ") signed_rows GROUP BY " + column_list +
 	       " HAVING SUM(" + weight + ") <> 0;\n";
 	if (!ducklake) {
-		string timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
+		string timestamp = publish_timestamp();
 		vector<string> delta_columns;
 		for (auto &column : quoted_columns) {
 			delta_columns.push_back("c." + column);
@@ -199,8 +221,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		                     : " CROSS JOIN UNNEST(range(CAST(abs(c." + weight + ") AS BIGINT))) repetitions";
 		sql += "INSERT INTO " + delta + " (" + column_list + ", openivm_multiplicity, openivm_timestamp) SELECT " +
 		       StringUtil::Join(delta_columns, ", ") + ", CAST(sign(c." + weight + ") AS INTEGER), " + timestamp +
-		       " FROM " + changes + " c" + expansion + " WHERE EXISTS (SELECT 1 FROM " + metadata_table +
-		       " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) + "');\n";
+		       " FROM " + changes + " c" + expansion + " WHERE EXISTS (" + consumers + ");\n";
 	}
 	// Replace only changed bags. DuckLake keeps its table identity and records the
 	// modifications in snapshots; native consumers read the explicit signed delta.
@@ -216,7 +237,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	}
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
 	if (!ducklake) {
-		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
+		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, delta_metadata_tables);
 	}
 	OPENIVM_DEBUG_PRINT("[PUBLISH] Compiled visible-row publication for %s\n", view_name.c_str());
 	return sql;

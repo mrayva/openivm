@@ -6,6 +6,7 @@
 //   cost_model_benchmark --scale 10 --delta-pcts 0,1,5,10,20,50 --reps 3 --out cost_model_sf10.csv
 //
 
+#include "core/materialized_result.hpp"
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "tpcc_helpers.hpp"
@@ -648,15 +649,15 @@ static void ApplyFlagConfig(duckdb::Connection &con, FlagConfig config) {
 		                         "openivm_skip_projection_delete", "openivm_minmax_incremental", "openivm_having_merge",
 		                         "openivm_left_join_merge", "openivm_full_outer_merge", "openivm_ducklake_nterm",
 		                         "openivm_distinct_aux_state"}) {
-			con.Query(string("SET ") + flag + " = false");
+			MatQuery(con, string("SET ") + flag + " = false");
 		}
 	} else if (config == FlagConfig::SKIP_EMPTY_OFF) {
-		con.Query("SET openivm_skip_empty_deltas = false");
+		MatQuery(con, "SET openivm_skip_empty_deltas = false");
 	}
 }
 
 static int64_t CountRows(duckdb::Connection &con, const string &table) {
-	auto result = con.Query("SELECT COUNT(*) FROM " + table);
+	auto result = MatQuery(con, "SELECT COUNT(*) FROM " + table);
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		return 0;
 	}
@@ -709,7 +710,7 @@ static int64_t ApplyDML(duckdb::Connection &con, const QueryDef &q, Workload wor
 		int allocation = workload == Workload::MIXED ? std::max(3, allocations[i]) : allocations[i];
 		auto dml = BuildWorkload(q.touched_tables[i], allocation, scale, workload, pk_offset);
 		for (auto &sql : dml) {
-			auto result = con.Query(sql);
+			auto result = MatQuery(con, sql);
 			if (!result || result->HasError()) {
 				throw std::runtime_error("DML on " + q.touched_tables[i] + ": " +
 				                         (result ? result->GetError() : "null result"));
@@ -744,17 +745,17 @@ static int64_t CountPendingDeltaRows(duckdb::Connection &con, const QueryDef &q)
 
 static void WarmScenario(duckdb::Connection &con, const QueryDef &q) {
 	for (auto &table : q.touched_tables) {
-		con.Query("SELECT COUNT(*) FROM " + table);
-		con.Query("SELECT COUNT(*) FROM " + DeltaTableName(table));
+		MatQuery(con, "SELECT COUNT(*) FROM " + table);
+		MatQuery(con, "SELECT COUNT(*) FROM " + DeltaTableName(table));
 	}
 	for (auto &mv : q.refresh_mvs) {
-		con.Query("SELECT COUNT(*) FROM " + mv);
+		MatQuery(con, "SELECT COUNT(*) FROM " + mv);
 	}
-	con.Query("SELECT COUNT(*) FROM (" + q.base_sql + ") warm_base");
+	MatQuery(con, "SELECT COUNT(*) FROM (" + q.base_sql + ") warm_base");
 }
 
 static int64_t ReadCount(duckdb::Connection &con, const string &sql) {
-	auto result = con.Query(sql);
+	auto result = MatQuery(con, sql);
 	if (!result || result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return 0;
 	}
@@ -771,7 +772,7 @@ static int64_t ReadBaseRows(duckdb::Connection &con, const QueryDef &q) {
 
 static CostEstimate ReadCost(duckdb::Connection &con, const string &view_name) {
 	CostEstimate cost;
-	auto result = con.Query("PRAGMA refresh_cost('" + view_name + "')");
+	auto result = MatQuery(con, "PRAGMA refresh_cost('" + view_name + "')");
 	if (!result || result->HasError() || result->RowCount() == 0) {
 		cost.error = result ? result->GetError() : "null result";
 		return cost;
@@ -823,13 +824,13 @@ static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const str
 	// Parenthesize both operands so a base query ending in ORDER BY/LIMIT (top-k views) is a valid
 	// set-operation operand instead of a syntax error.
 	string left = "SELECT COUNT(*) FROM ((SELECT * FROM " + mv_name + ") EXCEPT ALL (" + base_sql + ")) x";
-	auto l = con.Query(left);
+	auto l = MatQuery(con, left);
 	if (!l || l->HasError()) {
 		error = l ? l->GetError() : "left validation returned null";
 		return false;
 	}
 	string right = "SELECT COUNT(*) FROM ((" + base_sql + ") EXCEPT ALL (SELECT * FROM " + mv_name + ")) x";
-	auto r = con.Query(right);
+	auto r = MatQuery(con, right);
 	if (!r || r->HasError()) {
 		error = r ? r->GetError() : "right validation returned null";
 		return false;
@@ -844,7 +845,7 @@ static bool ValidateMV(duckdb::Connection &con, const string &mv_name, const str
 }
 
 static string LastHistoryMethod(duckdb::Connection &con, const string &view_name) {
-	auto result = con.Query("PRAGMA refresh_history(" + duckdb::Value(view_name).ToSQLString() + ")");
+	auto result = MatQuery(con, "PRAGMA refresh_history(" + duckdb::Value(view_name).ToSQLString() + ")");
 	if (!result || result->HasError()) {
 		throw std::runtime_error("Refresh history: " + (result ? result->GetError() : "null result"));
 	}
@@ -856,14 +857,14 @@ static string LastHistoryMethod(duckdb::Connection &con, const string &view_name
 
 static void ConfigureMode(duckdb::Connection &con, RefreshMode mode) {
 	if (mode == RefreshMode::AUTO) {
-		con.Query("SET openivm_refresh_mode = 'auto'");
-		con.Query("SET openivm_adaptive_refresh = true");
+		MatQuery(con, "SET openivm_refresh_mode = 'auto'");
+		MatQuery(con, "SET openivm_adaptive_refresh = true");
 	} else if (mode == RefreshMode::INCREMENTAL) {
-		con.Query("SET openivm_refresh_mode = 'incremental'");
-		con.Query("SET openivm_adaptive_refresh = false");
+		MatQuery(con, "SET openivm_refresh_mode = 'incremental'");
+		MatQuery(con, "SET openivm_adaptive_refresh = false");
 	} else {
-		con.Query("SET openivm_refresh_mode = 'full'");
-		con.Query("SET openivm_adaptive_refresh = false");
+		MatQuery(con, "SET openivm_refresh_mode = 'full'");
+		MatQuery(con, "SET openivm_adaptive_refresh = false");
 	}
 }
 
@@ -913,28 +914,28 @@ static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Wo
 		// file. A snapshot taken while it is open could miss writes still sitting in the WAL.
 		duckdb::DuckDB db(prepared.state->path);
 		duckdb::Connection con(db);
-		auto load = con.Query("LOAD openivm");
+		auto load = MatQuery(con, "LOAD openivm");
 		if (!load || load->HasError()) {
 			prepared.error = "LOAD openivm: " + (load ? load->GetError() : "null result");
 			return prepared;
 		}
 		ApplyFlagConfig(con, flag_config);
 		for (auto &sql : q.setup_sql) {
-			auto result = con.Query(sql);
+			auto result = MatQuery(con, sql);
 			if (!result || result->HasError()) {
 				prepared.error = "setup failed: " + (result ? result->GetError() : "null result");
 				return prepared;
 			}
 		}
 		for (auto &sql : q.query_settings) {
-			auto result = con.Query(sql);
+			auto result = MatQuery(con, sql);
 			if (!result || result->HasError()) {
 				prepared.error = "query setting failed: " + (result ? result->GetError() : "null result");
 				return prepared;
 			}
 		}
 		for (auto &sql : q.create_mvs) {
-			auto result = con.Query(sql);
+			auto result = MatQuery(con, sql);
 			if (!result || result->HasError()) {
 				prepared.error = "CREATE MV failed: " + (result ? result->GetError() : "null result");
 				return prepared;
@@ -960,13 +961,13 @@ static bool ApplyCycleDelta(PreparedCase &prepared, const QueryDef &q, Workload 
 	try {
 		duckdb::DuckDB db(prepared.state->path);
 		duckdb::Connection con(db);
-		auto load = con.Query("LOAD openivm");
+		auto load = MatQuery(con, "LOAD openivm");
 		if (!load || load->HasError()) {
 			error = "LOAD openivm: " + (load ? load->GetError() : "null result");
 			return false;
 		}
 		for (auto &sql : q.query_settings) {
-			con.Query(sql);
+			MatQuery(con, sql);
 		}
 		prepared.dml_statements = ApplyDML(con, q, workload, delta_pct, scale, prepared.pk_cursor);
 		prepared.delta_rows = CountPendingDeltaRows(con, q);
@@ -1006,7 +1007,7 @@ static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workl
 	try {
 		duckdb::DuckDB db(temp.path);
 		duckdb::Connection con(db);
-		auto load = con.Query("LOAD openivm");
+		auto load = MatQuery(con, "LOAD openivm");
 		if (!load || load->HasError()) {
 			out.error = "LOAD openivm: " + (load ? load->GetError() : "null result");
 			return out;
@@ -1014,7 +1015,7 @@ static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workl
 		// Settings live in the session, not in the file, so they are re-applied on the restored copy.
 		ApplyFlagConfig(con, flag_config);
 		for (auto &sql : q.query_settings) {
-			auto result = con.Query(sql);
+			auto result = MatQuery(con, sql);
 			if (!result || result->HasError()) {
 				out.error = "query setting failed: " + (result ? result->GetError() : "null result");
 				return out;
@@ -1037,7 +1038,7 @@ static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workl
 				stage_costs.push_back(std::move(stage_cost));
 			}
 			auto refresh_start = NowMicros();
-			auto result = con.Query("PRAGMA refresh('" + mv + "')");
+			auto result = MatQuery(con, "PRAGMA refresh('" + mv + "')");
 			if (!result || result->HasError()) {
 				out.error = "PRAGMA refresh failed: " + (result ? result->GetError() : "null result");
 				return out;
@@ -1223,7 +1224,7 @@ int main(int argc, char **argv) {
 		duckdb::Connection con(db);
 		CreateTPCCSchema(con);
 		InsertTPCCData(con, scale, openivm_bench::TPCCScaleProfile::SPEC);
-		con.Query("PRAGMA checkpoint");
+		MatQuery(con, "PRAGMA checkpoint");
 	}
 
 	auto queries = BuildQueries();

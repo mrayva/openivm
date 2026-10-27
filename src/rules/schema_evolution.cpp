@@ -1,12 +1,16 @@
 #include "rules/schema_evolution.hpp"
 
 #include "core/openivm_constants.hpp"
+#include "core/openivm_debug.hpp"
 #include "core/parser_plan_helpers.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/common/enums/database_modification_type.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
@@ -16,6 +20,13 @@
 #include "duckdb/parser/query_node/set_operation_node.hpp"
 #include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/list.hpp"
+#include "duckdb/planner/bound_constraint.hpp"
+#include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/storage/data_table.hpp"
+#include "duckdb/storage/table/scan_state.hpp"
+#include "duckdb/storage/table/update_state.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/meta_transaction.hpp"
 
 #include <unordered_set>
 
@@ -44,8 +55,8 @@ static vector<DependentView> GetDependentViews(Connection &con, const string &de
                                                const string &source_schema) {
 	vector<DependentView> views;
 	auto result =
-	    con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-	              RefreshMetadata::SourcePredicate(delta_name, source_catalog, source_schema) + " ORDER BY 1");
+	    MatQuery(con, "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
+	                      RefreshMetadata::SourcePredicate(delta_name, source_catalog, source_schema) + " ORDER BY 1");
 	if (result->HasError()) {
 		return views;
 	}
@@ -60,9 +71,9 @@ static vector<DependentView> GetDependentViews(Connection &con, const string &de
 
 static void UpdateViewMetadataValue(Connection &con, const string &view_name, const string &column_name,
                                     const string &value) {
-	auto result =
-	    con.Query("UPDATE " + string(openivm::VIEWS_TABLE) + " SET " + column_name + " = '" +
-	              SqlUtils::EscapeValue(value) + "' WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
+	auto result = MatQuery(con, "UPDATE " + string(openivm::VIEWS_TABLE) + " SET " + column_name + " = '" +
+	                                SqlUtils::EscapeValue(value) + "' WHERE view_name = '" +
+	                                SqlUtils::EscapeValue(view_name) + "'");
 	if (result->HasError()) {
 		throw CatalogException("Cannot update metadata for materialized view '" + view_name +
 		                       "': " + result->GetError());
@@ -149,7 +160,8 @@ static bool RewriteExpressionScoped(unique_ptr<ParsedExpression> &expr, const st
 	bool changed = false;
 	ParsedExpressionIterator::VisitExpressionMutable<SubqueryExpression>(*expr, [&](SubqueryExpression &subquery) {
 		if (subquery.Subquery() && subquery.Subquery()->node) {
-			changed |= RewriteQueryNodeScoped(*subquery.Subquery()->node, table_name, old_name, new_name, target_aliases);
+			changed |=
+			    RewriteQueryNodeScoped(*subquery.Subquery()->node, table_name, old_name, new_name, target_aliases);
 		}
 	});
 	ParsedExpressionIterator::VisitExpressionMutable<ColumnRefExpression>(*expr, [&](ColumnRefExpression &ref) {
@@ -311,14 +323,14 @@ static void PreserveTopLevelOutputAliases(SelectStatement &stmt, const vector<st
 	}
 }
 
-static bool RewriteStoredViewQuery(Connection &con, RefreshMetadata &metadata, const string &view_name,
-                                   const string &table_name, const string &old_name, const string &new_name,
-                                   bool persist) {
+static bool RewriteStoredViewQuery(ClientContext &context, Connection &con, RefreshMetadata &metadata,
+                                   const string &view_name, const string &table_name, const string &old_name,
+                                   const string &new_name, bool persist) {
 	string sql = metadata.GetViewQuery(view_name);
 	if (sql.empty()) {
 		return false;
 	}
-	Parser parser;
+	Parser parser(context);
 	parser.ParseQuery(sql);
 	if (parser.statements.empty() || parser.statements[0]->type != StatementType::SELECT_STATEMENT) {
 		throw CatalogException("Cannot rewrite materialized view '" + view_name +
@@ -332,8 +344,15 @@ static bool RewriteStoredViewQuery(Connection &con, RefreshMetadata &metadata, c
 	if (!persist) {
 		return true;
 	}
-	PreserveTopLevelOutputAliases(stmt,
-	                              metadata.GetTableColumns("", "", IncrementalTableNames::DataTableName(view_name)));
+	auto internal_location = metadata.GetInternalLocation(view_name);
+	auto &data =
+	    GetCatalogEntry<TableCatalogEntry>(context, internal_location.catalog_name, internal_location.schema_name,
+	                                       IncrementalTableNames::DataTableName(view_name));
+	vector<string> output_columns;
+	for (auto &column : data.GetColumns().Physical()) {
+		output_columns.push_back(column.Name().GetIdentifierName());
+	}
+	PreserveTopLevelOutputAliases(stmt, output_columns);
 	string rewritten = stmt.ToString();
 	UpdateViewMetadataValue(con, view_name, "sql_string", rewritten);
 	return true;
@@ -579,12 +598,14 @@ static bool AuxMetadataReferencesColumn(RefreshMetadata &metadata, const string 
 	return false;
 }
 
-string FirstMVReferencingColumn(Connection &con, const string &delta_name, const string &source_catalog,
-                                const string &source_schema, const string &table_name, const string &col_name) {
+string FirstMVReferencingColumn(ClientContext &context, Connection &con, const string &delta_name,
+                                const string &source_catalog, const string &source_schema, const string &table_name,
+                                const string &col_name) {
 	RefreshMetadata metadata(con);
 	auto qualified_source = SqlUtils::FullName(source_catalog, source_schema, table_name);
 	for (auto &view : GetDependentViews(con, delta_name, source_catalog, source_schema)) {
-		if (RewriteStoredViewQuery(con, metadata, view.name, qualified_source, col_name, col_name, /*persist=*/false) ||
+		if (RewriteStoredViewQuery(context, con, metadata, view.name, qualified_source, col_name, col_name,
+		                           /*persist=*/false) ||
 		    AuxMetadataReferencesColumn(metadata, view.name, qualified_source, col_name)) {
 			// Report the name the user created, not the internal storage key.
 			auto sql_name = metadata.GetViewSQLName(view.name);
@@ -594,9 +615,102 @@ string FirstMVReferencingColumn(Connection &con, const string &delta_name, const
 	return "";
 }
 
-void RewriteDependentViewMetadataForRename(Connection &con, const string &delta_name, const string &source_catalog,
-                                           const string &source_schema, const string &table_name,
-                                           const string &old_name, const string &new_name) {
+// These metadata fields are unindexed, nullable strings. Update them through
+// the caller's storage transaction, including rows/tables created earlier in BEGIN.
+// Running SQL on a helper would neither see those rows nor roll back with ALTER.
+static void UpdateCallerViewMetadata(ClientContext &context, const MetadataLocation &location, const string &view_name,
+                                     const vector<string> &names, const vector<Value> &values) {
+	auto &entry = GetCatalogEntry<TableCatalogEntry>(context, location.catalog, location.schema, openivm::VIEWS_TABLE);
+	MetaTransaction::Get(context).ModifyDatabase(entry.catalog.GetAttached(), DatabaseModificationType::UPDATE_DATA);
+	vector<PhysicalIndex> columns;
+	vector<LogicalType> types;
+	for (auto &name : names) {
+		auto &column = entry.GetColumn(Identifier(name));
+		D_ASSERT(column.Type() == LogicalType::VARCHAR && name != "view_name");
+		columns.push_back(column.Physical());
+		types.push_back(column.Type());
+	}
+	auto &storage = entry.GetStorage();
+	auto &transaction = DuckTransaction::Get(context, entry.catalog);
+	TableScanState scan;
+	storage.InitializeScan(
+	    context, transaction, scan,
+	    {StorageIndex(entry.GetColumn("view_name").StorageOid()), StorageIndex(COLUMN_IDENTIFIER_ROW_ID)});
+	DataChunk rows;
+	rows.Initialize(Allocator::Get(context), {LogicalType::VARCHAR, LogicalType::ROW_TYPE});
+	while (true) {
+		rows.Reset();
+		storage.Scan(transaction, rows, scan);
+		if (rows.size() == 0) {
+			throw CatalogException("Cannot update caller-visible metadata for materialized view '%s'", view_name);
+		}
+		for (idx_t row = 0; row < rows.size(); row++) {
+			if (rows.GetValue(0, row).ToString() != view_name) {
+				continue;
+			}
+			Vector row_ids(LogicalType::ROW_TYPE);
+			row_ids.SetValue(0, rows.GetValue(1, row));
+			DataChunk updates;
+			updates.Initialize(Allocator::Get(context), types);
+			updates.SetCardinality(1);
+			for (idx_t col = 0; col < values.size(); col++) {
+				updates.SetValue(col, 0, values[col]);
+			}
+			vector<unique_ptr<BoundConstraint>> constraints;
+			auto state = storage.InitializeUpdate(entry, context, constraints);
+			storage.Update(*state, context, entry.Cast<DuckTableEntry>(), row_ids, columns, updates);
+			return;
+		}
+	}
+}
+
+static void PersistRenamedViewMetadata(ClientContext &context, Connection &con, const string &source_catalog,
+                                       MaterializedQueryResult &before, MaterializedQueryResult &after) {
+	D_ASSERT(before.RowCount() == after.RowCount());
+	auto location = RefreshMetadata::CurrentLocation(con);
+	auto target = RefreshMetadata::MetadataTable(con, openivm::VIEWS_TABLE);
+	idx_t key_column = 0;
+	while (before.names[key_column] != "view_name") {
+		key_column++;
+	}
+	for (idx_t row = 0; row < before.RowCount(); row++) {
+		vector<string> names;
+		vector<Value> values;
+		vector<string> assignments;
+		auto key = before.GetValue(key_column, row);
+		D_ASSERT(Value::NotDistinctFrom(key, after.GetValue(key_column, row)));
+		for (idx_t col = 0; col < before.ColumnCount(); col++) {
+			auto value = after.GetValue(col, row);
+			if (!Value::NotDistinctFrom(before.GetValue(col, row), value)) {
+				names.push_back(before.names[col]);
+				values.push_back(value);
+				assignments.push_back(SqlUtils::QuoteIdentifier(before.names[col]) + " = " + value.ToSQLString());
+			}
+		}
+		if (names.empty()) {
+			continue;
+		}
+		auto sql = "UPDATE " + target + " SET " + StringUtil::Join(assignments, ", ") +
+		           " WHERE view_name = " + key.ToSQLString();
+		if (StringUtil::CIEquals(location.catalog, source_catalog)) {
+			UpdateCallerViewMetadata(context, location, key.ToString(), names, values);
+		} else {
+			// A different native catalog cannot join the caller's ALTER transaction.
+			// Its durable preimage is retained by TransactionalHelperUndoState.
+			auto result = MatQuery(con, sql);
+			if (result->HasError()) {
+				throw CatalogException("Cannot persist renamed materialized view metadata: %s", result->GetError());
+			}
+		}
+		TransactionalMVMetadataState::Get(context).RegisterSQL(sql, key.ToString());
+		OPENIVM_DEBUG_PRINT("[SCHEMA EVOLUTION] Rewrote metadata for '%s' in %s.%s\n", key.ToString().c_str(),
+		                    location.catalog.c_str(), location.schema.c_str());
+	}
+}
+
+void RewriteDependentViewMetadataForRename(ClientContext &context, Connection &con, const string &delta_name,
+                                           const string &source_catalog, const string &source_schema,
+                                           const string &table_name, const string &old_name, const string &new_name) {
 	RefreshMetadata metadata(con);
 	auto qualified_source = SqlUtils::FullName(source_catalog, source_schema, table_name);
 	auto views = GetDependentViews(con, delta_name, source_catalog, source_schema);
@@ -604,14 +718,24 @@ void RewriteDependentViewMetadataForRename(Connection &con, const string &delta_
 	try {
 		con.BeginTransaction();
 		tx_open = true;
+		auto before = MatQuery(con, "SELECT * FROM openivm_views ORDER BY view_name");
+		if (before->HasError()) {
+			throw CatalogException("Cannot snapshot materialized view rename metadata: %s", before->GetError());
+		}
 		for (auto &view : views) {
-			RewriteStoredViewQuery(con, metadata, view.name, qualified_source, old_name, new_name, /*persist=*/true);
+			RewriteStoredViewQuery(context, con, metadata, view.name, qualified_source, old_name, new_name,
+			                       /*persist=*/true);
 			RewriteDistinctAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteFilteredGroupCountMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteSemiAntiAuxMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteLineageMeta(con, metadata, view.name, qualified_source, old_name, new_name);
 			RewriteWindowGroupColumnSources(con, metadata, view.name, old_name, new_name);
 		}
+		auto after = MatQuery(con, "SELECT * FROM openivm_views ORDER BY view_name");
+		if (after->HasError()) {
+			throw CatalogException("Cannot read materialized view rename metadata: %s", after->GetError());
+		}
+		PersistRenamedViewMetadata(context, con, source_catalog, *before, *after);
 		con.Commit();
 		tx_open = false;
 	} catch (std::exception &) {

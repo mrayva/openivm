@@ -138,7 +138,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_GET:
-		if (StringUtil::CIEquals(node->Cast<LogicalGet>().function.name.GetIdentifierName(), "unnest")) {
+		if (StringUtil::CIEquals(node->Cast<LogicalGet>().function.GetName().GetIdentifierName(), "unnest")) {
 			result.found_unnest = true;
 		}
 		break;
@@ -360,15 +360,15 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		// key is unique; differing or computed window keys keep the existing
 		// partition-recompute path.
 		for (auto &expr : window.expressions) {
-				if (expr->GetExpressionClass() == ExpressionClass::BOUND_WINDOW) {
+			if (expr->GetExpressionClass() == ExpressionClass::BOUND_WINDOW) {
 				auto &win_expr = expr->Cast<BoundWindowExpression>();
 				vector<string> current_partitions;
 				vector<string> current_orders;
-					for (auto &part : win_expr.Partitions()) {
+				for (auto &part : win_expr.Partitions()) {
 					string col_name;
 					if (!WindowColumn(*part, col_name)) {
 						result.window_row_key_compatible = false;
-							col_name = part->GetName().GetIdentifierName();
+						col_name = part->GetName().GetIdentifierName();
 					}
 					current_partitions.push_back(col_name);
 					// Avoid duplicates
@@ -383,7 +383,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 						result.window_partition_columns.push_back(col_name);
 					}
 				}
-					for (auto &order : win_expr.OrderBy()) {
+				for (auto &order : win_expr.OrderBy()) {
 					string col_name;
 					if (!WindowColumn(*order.expression, col_name)) {
 						result.window_row_key_compatible = false;

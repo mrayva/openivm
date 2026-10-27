@@ -78,7 +78,8 @@ static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts
 	if (facts.root) {
 		if (output_idx < bindings.size()) {
 			auto &binding = bindings[output_idx];
-			return ResolvesToAggregateValueBinding(binding.table_index.index, binding.column_index.GetIndexUnsafe(), facts);
+			return ResolvesToAggregateValueBinding(binding.table_index.index, binding.column_index.GetIndexUnsafe(),
+			                                       facts);
 		}
 	}
 	if (!facts.first_projection || output_idx >= facts.first_projection->expressions.size()) {
@@ -86,7 +87,7 @@ static bool VisibleOutputResolvesToAggregateValue(const CreateMVPlanFacts &facts
 	}
 	auto *bcr = GetColumnRefThroughCasts(facts.first_projection->expressions[output_idx].get());
 	return bcr && ResolvesToAggregateValueBinding(bcr->Binding().table_index.index,
-	                                            bcr->Binding().column_index.GetIndexUnsafe(), facts);
+	                                              bcr->Binding().column_index.GetIndexUnsafe(), facts);
 }
 
 static bool CanInspectVisibleOutputBinding(const CreateMVPlanFacts &facts, const vector<ColumnBinding> &bindings,
@@ -361,7 +362,7 @@ static bool IsTransparentDistinctWrapper(LogicalOperatorType type) {
 }
 
 static bool HasUnionDistinctSemantics(const PlanAnalysis &analysis, const CreateMVPlanFacts &facts,
-                                     bool distinct_at_top) {
+                                      bool distinct_at_top) {
 	return analysis.found_union_distinct ||
 	       (analysis.found_distinct && distinct_at_top && facts.has_union_before_aggregate);
 }
@@ -565,8 +566,7 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 		// to SUM(delta) is incorrect: a negative delta does not imply a negative new
 		// group total. Recompute only the affected groups from current base state.
 		model.type = RefreshType::GROUP_RECOMPUTE;
-	} else if (analysis.found_distinct && !has_union_distinct && model.distinct_at_top &&
-	           analysis.found_aggregation) {
+	} else if (analysis.found_distinct && !has_union_distinct && model.distinct_at_top && analysis.found_aggregation) {
 		// DISTINCT over multiple aggregate result rows is a second non-linear
 		// aggregation level. The outer DISTINCT key is an aggregate value, not
 		// a source group key that affected-group recompute can recover.

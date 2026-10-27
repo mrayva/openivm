@@ -3,6 +3,7 @@
 # group: [sql]
 
 require openivm
+
 require parquet
 
 statement ok

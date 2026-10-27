@@ -1,3 +1,4 @@
+#include "core/materialized_result.hpp"
 #include "tpcdi_helpers.hpp"
 
 #include <string>
@@ -7,7 +8,7 @@ namespace openivm_bench {
 
 // Run SQL and silently ignore errors (used for pre-computed derived tables).
 static void Exec(duckdb::Connection &con, const std::string &sql) {
-	auto r = con.Query(sql);
+	auto r = MatQuery(con, sql);
 	(void)r;
 }
 
@@ -25,49 +26,49 @@ void CreateTPCDISchema(duckdb::Connection &con) {
 	    " t_is_cash BOOLEAN, t_s_symb VARCHAR, t_qty INT, t_bid_price DOUBLE,"
 	    " t_ca_id BIGINT, t_exec_name VARCHAR, t_trade_price DOUBLE,"
 	    " t_chrg DOUBLE, t_comm DOUBLE, t_tax DOUBLE)";
-	con.Query(std::string("CREATE TABLE batch1_trade ") + trade_ddl);
-	con.Query(std::string("CREATE TABLE batch2_trade ") + trade_ddl);
-	con.Query(std::string("CREATE TABLE batch3_trade ") + trade_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch1_trade ") + trade_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_trade ") + trade_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_trade ") + trade_ddl);
 
-	con.Query("CREATE TABLE batch1_trade_history"
+	MatQuery(con, "CREATE TABLE batch1_trade_history"
 	          "(th_t_id VARCHAR, th_dts TIMESTAMP, th_st_id VARCHAR)");
 
 	const char *dm_ddl = "(dm_date DATE, dm_s_symb VARCHAR,"
 	                     " dm_close DOUBLE, dm_high DOUBLE, dm_low DOUBLE, dm_vol BIGINT)";
-	con.Query(std::string("CREATE TABLE batch1_daily_market ") + dm_ddl);
-	con.Query(std::string("CREATE TABLE batch2_daily_market ") + dm_ddl);
-	con.Query(std::string("CREATE TABLE batch3_daily_market ") + dm_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch1_daily_market ") + dm_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_daily_market ") + dm_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_daily_market ") + dm_ddl);
 
 	const char *hh_ddl = "(hh_h_t_id VARCHAR, hh_t_id VARCHAR,"
 	                     " hh_before_qty INT, hh_after_qty INT)";
-	con.Query(std::string("CREATE TABLE batch1_holding_history ") + hh_ddl);
-	con.Query(std::string("CREATE TABLE batch2_holding_history ") + hh_ddl);
-	con.Query(std::string("CREATE TABLE batch3_holding_history ") + hh_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch1_holding_history ") + hh_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_holding_history ") + hh_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_holding_history ") + hh_ddl);
 
 	const char *wh_ddl = "(w_c_id BIGINT, w_s_symb VARCHAR,"
 	                     " w_dts TIMESTAMP, w_action VARCHAR)";
-	con.Query(std::string("CREATE TABLE batch1_watch_history ") + wh_ddl);
-	con.Query(std::string("CREATE TABLE batch2_watch_history ") + wh_ddl);
-	con.Query(std::string("CREATE TABLE batch3_watch_history ") + wh_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch1_watch_history ") + wh_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_watch_history ") + wh_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_watch_history ") + wh_ddl);
 
 	const char *ct_ddl = "(ct_ca_id BIGINT, ct_dts TIMESTAMP,"
 	                     " ct_amt DOUBLE, ct_name VARCHAR)";
-	con.Query(std::string("CREATE TABLE batch1_cash_transaction ") + ct_ddl);
-	con.Query(std::string("CREATE TABLE batch2_cash_transaction ") + ct_ddl);
-	con.Query(std::string("CREATE TABLE batch3_cash_transaction ") + ct_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch1_cash_transaction ") + ct_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_cash_transaction ") + ct_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_cash_transaction ") + ct_ddl);
 
-	con.Query("CREATE TABLE batch1_hr"
+	MatQuery(con, "CREATE TABLE batch1_hr"
 	          "(employeeid BIGINT, managerid BIGINT,"
 	          " employeefirstname VARCHAR, employeelastname VARCHAR, employeemi VARCHAR,"
 	          " employeejobcode VARCHAR, employeebranch VARCHAR,"
 	          " employeeoffice VARCHAR, employeephone VARCHAR)");
 
-	con.Query("CREATE TABLE batch1_status_type(st_id VARCHAR, st_name VARCHAR)");
-	con.Query("CREATE TABLE batch1_tax_rate(tx_id VARCHAR, tx_name VARCHAR, tx_rate DOUBLE)");
-	con.Query("CREATE TABLE batch1_trade_type(tt_id VARCHAR, tt_name VARCHAR)");
-	con.Query("CREATE TABLE batch1_industry(in_id VARCHAR, in_name VARCHAR, in_sc_id VARCHAR)");
+	MatQuery(con, "CREATE TABLE batch1_status_type(st_id VARCHAR, st_name VARCHAR)");
+	MatQuery(con, "CREATE TABLE batch1_tax_rate(tx_id VARCHAR, tx_name VARCHAR, tx_rate DOUBLE)");
+	MatQuery(con, "CREATE TABLE batch1_trade_type(tt_id VARCHAR, tt_name VARCHAR)");
+	MatQuery(con, "CREATE TABLE batch1_industry(in_id VARCHAR, in_name VARCHAR, in_sc_id VARCHAR)");
 
-	con.Query("CREATE TABLE batch1_date("
+	MatQuery(con, "CREATE TABLE batch1_date("
 	          "sk_dateid BIGINT, datevalue DATE, datedesc VARCHAR,"
 	          " calendaryearid INT, calendaryeardesc VARCHAR,"
 	          " calendarqtrid INT, calendarqtrdesc VARCHAR,"
@@ -87,17 +88,17 @@ void CreateTPCDISchema(duckdb::Connection &con) {
 	    " maritalstatus VARCHAR, age INT, creditrating INT,"
 	    " ownorrentflag VARCHAR, employer VARCHAR,"
 	    " numbercreditcards INT, networth DOUBLE)";
-	con.Query(std::string("CREATE TABLE batch1_prospect ") + prospect_ddl);
-	con.Query(std::string("CREATE TABLE batch2_prospect ") + prospect_ddl);
-	con.Query(std::string("CREATE TABLE batch3_prospect ") + prospect_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch1_prospect ") + prospect_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_prospect ") + prospect_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_prospect ") + prospect_ddl);
 
 	// ── Raw finwire + CRM staging tables (bronze-layer input) ───────────────
 	// batch1_finwire: fixed-width lines parsed by query0008/0009/0010.
 	// batch1_customer_mgmt: XML struct parsed by query0007.
 	// batch2/3_customer + batch2/3_account: CDC flat files for query0007 batches 2/3.
-	con.Query("CREATE TABLE batch1_finwire(pts TIMESTAMP, rec_type VARCHAR, line VARCHAR)");
+	MatQuery(con, "CREATE TABLE batch1_finwire(pts TIMESTAMP, rec_type VARCHAR, line VARCHAR)");
 
-	con.Query("CREATE TABLE batch1_customer_mgmt("
+	MatQuery(con, "CREATE TABLE batch1_customer_mgmt("
 	          " \"_ActionTS\" TIMESTAMP,"
 	          " \"_ActionType\" VARCHAR,"
 	          " \"Customer\" STRUCT("
@@ -133,14 +134,14 @@ void CreateTPCDISchema(duckdb::Connection &con) {
 	    " c_ctry_2 VARCHAR, c_area_2 VARCHAR, c_local_2 VARCHAR, c_ext_2 VARCHAR,"
 	    " c_ctry_3 VARCHAR, c_area_3 VARCHAR, c_local_3 VARCHAR, c_ext_3 VARCHAR,"
 	    " lcl_tx_id VARCHAR, nat_tx_id VARCHAR)";
-	con.Query(std::string("CREATE TABLE batch2_customer ") + cust_cdc_ddl);
-	con.Query(std::string("CREATE TABLE batch3_customer ") + cust_cdc_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_customer ") + cust_cdc_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_customer ") + cust_cdc_ddl);
 
 	const char *acct_cdc_ddl =
 	    "(cdc_dsn BIGINT, cdc_flag VARCHAR,"
 	    " ca_c_id BIGINT, accountid BIGINT, taxstatus INT, ca_b_id BIGINT, accountdesc VARCHAR)";
-	con.Query(std::string("CREATE TABLE batch2_account ") + acct_cdc_ddl);
-	con.Query(std::string("CREATE TABLE batch3_account ") + acct_cdc_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch2_account ") + acct_cdc_ddl);
+	MatQuery(con, std::string("CREATE TABLE batch3_account ") + acct_cdc_ddl);
 
 	// ── Pre-computed flat bronze tables (bypass XML/finwire parsing) ──────────
 	// These are the direct source tables for the silver-layer queries in the
@@ -148,7 +149,7 @@ void CreateTPCDISchema(duckdb::Connection &con) {
 	// data rather than re-parsing batch1_customer_mgmt (XML struct) or
 	// batch1_finwire (fixed-width lines).
 
-	con.Query("CREATE TABLE crm_customer_mgmt("
+	MatQuery(con, "CREATE TABLE crm_customer_mgmt("
 	          " action_ts TIMESTAMP, action_type VARCHAR,"
 	          " c_id BIGINT, c_tax_id VARCHAR, c_gndr VARCHAR, c_tier INT, c_dob DATE,"
 	          " c_l_name VARCHAR, c_f_name VARCHAR, c_m_name VARCHAR,"
@@ -159,14 +160,14 @@ void CreateTPCDISchema(duckdb::Connection &con) {
 	          " c_lcl_tx_id VARCHAR, c_nat_tx_id VARCHAR,"
 	          " ca_id BIGINT, ca_b_id BIGINT, ca_tax_st INT, ca_name VARCHAR)");
 
-	con.Query("CREATE TABLE finwire_company("
+	MatQuery(con, "CREATE TABLE finwire_company("
 	          " pts TIMESTAMP, company_name VARCHAR, cik VARCHAR,"
 	          " status VARCHAR, industry_id VARCHAR, sp_rating VARCHAR,"
 	          " founding_date DATE, address_line1 VARCHAR, address_line2 VARCHAR,"
 	          " postal_code VARCHAR, city VARCHAR, state_province VARCHAR,"
 	          " country VARCHAR, ceo_name VARCHAR, description VARCHAR)");
 
-	con.Query("CREATE TABLE finwire_financial("
+	MatQuery(con, "CREATE TABLE finwire_financial("
 	          " pts TIMESTAMP, year INT, quarter INT,"
 	          " quarter_start_date DATE, posting_date DATE,"
 	          " revenue DOUBLE, earnings DOUBLE, eps DOUBLE, diluted_eps DOUBLE,"
@@ -174,7 +175,7 @@ void CreateTPCDISchema(duckdb::Connection &con) {
 	          " sh_out BIGINT, diluted_sh_out BIGINT,"
 	          " cik BIGINT, company_name VARCHAR)");
 
-	con.Query("CREATE TABLE finwire_security("
+	MatQuery(con, "CREATE TABLE finwire_security("
 	          " pts TIMESTAMP, symbol VARCHAR, issue_type VARCHAR,"
 	          " status VARCHAR, name VARCHAR, ex_id VARCHAR,"
 	          " sh_out BIGINT, first_trade_date DATE, first_exchange_date DATE,"
@@ -193,17 +194,17 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 	// ── Reference data ────────────────────────────────────────────────────────
 	for (const char *r : {"('ACTV','Active')", "('CMPT','Completed')",
 	                      "('SBMT','Submitted')", "('CNCL','Canceled')"})
-		con.Query(std::string("INSERT INTO batch1_status_type VALUES ") + r);
+		MatQuery(con, std::string("INSERT INTO batch1_status_type VALUES ") + r);
 
 	for (const char *r : {"('TX_LOCAL','Local Tax',0.05)", "('TX_NAT','National Tax',0.15)"})
-		con.Query(std::string("INSERT INTO batch1_tax_rate VALUES ") + r);
+		MatQuery(con, std::string("INSERT INTO batch1_tax_rate VALUES ") + r);
 
 	for (const char *r : {"('TMB','Market Buy')", "('TMS','Market Sell')", "('TLB','Limit Buy')"})
-		con.Query(std::string("INSERT INTO batch1_trade_type VALUES ") + r);
+		MatQuery(con, std::string("INSERT INTO batch1_trade_type VALUES ") + r);
 
 	for (const char *r :
 	     {"('IND1','Technology','TECH')", "('IND2','Finance','FIN')", "('IND3','Healthcare','HLT')"})
-		con.Query(std::string("INSERT INTO batch1_industry VALUES ") + r);
+		MatQuery(con, std::string("INSERT INTO batch1_industry VALUES ") + r);
 
 	// 20 representative dates in Jan-Feb 2023
 	{
@@ -218,7 +219,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 			std::string date = std::string("2023-0") + std::to_string(month) + "-" +
 			                   (day < 10 ? "0" : "") + std::to_string(day);
 			int sk = 20230000 + month * 100 + day;
-			con.Query("INSERT INTO batch1_date VALUES (" + std::to_string(sk) +
+			MatQuery(con, "INSERT INTO batch1_date VALUES (" + std::to_string(sk) +
 			          ",DATE '" + date + "','Date " + date + "',"
 			          "2023,'Year 2023'," +
 			          std::to_string(month == 1 ? 1 : 1) + ",'Q1 2023'," +
@@ -233,7 +234,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 	int n_emp = n * 3;
 	for (int e = 1; e <= n_emp; e++) {
 		long long mgr = (e == 1) ? 1 : 1; // all report to employee 1
-		con.Query("INSERT INTO batch1_hr VALUES (" + std::to_string(e) + "," +
+		MatQuery(con, "INSERT INTO batch1_hr VALUES (" + std::to_string(e) + "," +
 		          std::to_string(mgr) + ",'First" + std::to_string(e) + "','Last" +
 		          std::to_string(e) + "','M','Trader','Branch1','Office1','555-" +
 		          std::to_string(1000 + e) + "')");
@@ -246,9 +247,9 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 		    "('AG" + std::to_string(p) + "','Last" + std::to_string(p) + "','First" +
 		    std::to_string(p) + "','M','M','123 Main St','','10001','New York','NY','US',"
 		    "'555-1001',80000.0,2,1,'M',35,700,'R','Corp',3,150000.0)";
-		con.Query("INSERT INTO batch1_prospect VALUES " + row);
-		con.Query("INSERT INTO batch2_prospect VALUES " + row);
-		con.Query("INSERT INTO batch3_prospect VALUES " + row);
+		MatQuery(con, "INSERT INTO batch1_prospect VALUES " + row);
+		MatQuery(con, "INSERT INTO batch2_prospect VALUES " + row);
+		MatQuery(con, "INSERT INTO batch3_prospect VALUES " + row);
 	}
 
 	// ── Companies (finwire_company) ───────────────────────────────────────────
@@ -257,7 +258,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 	for (int c = 1; c <= n_co; c++) {
 		std::string cik = std::to_string(1000 + c);
 		std::string ind = ind_ids[(c - 1) % 3];
-		con.Query("INSERT INTO finwire_company VALUES("
+		MatQuery(con, "INSERT INTO finwire_company VALUES("
 		          "TIMESTAMP '2020-01-01 00:00:00',"
 		          "'Company " +
 		          std::to_string(c) + "','" + cik +
@@ -273,7 +274,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 		for (int q = 1; q <= 2; q++) {
 			std::string qs = "2023-" + std::to_string((q - 1) * 3 + 1) + "-01";
 			std::string ps = "2023-" + std::to_string((q - 1) * 3 + 2) + "-15";
-			con.Query("INSERT INTO finwire_financial VALUES("
+			MatQuery(con, "INSERT INTO finwire_financial VALUES("
 			          "TIMESTAMP '2020-01-01 00:00:00',"
 			          "2023," +
 			          std::to_string(q) + ",DATE '" + qs + "',DATE '" + ps + "',"
@@ -288,7 +289,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 	for (int s = 1; s <= n_sec; s++) {
 		std::string sym = std::string("SYM") + (s < 10 ? "00" : s < 100 ? "0" : "") + std::to_string(s);
 		long long cik = 1000 + ((s - 1) % n_co) + 1;
-		con.Query("INSERT INTO finwire_security VALUES("
+		MatQuery(con, "INSERT INTO finwire_security VALUES("
 		          "TIMESTAMP '2020-01-01 00:00:00','" +
 		          sym +
 		          "','CS','ACTV','"
@@ -304,7 +305,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 		long long cid = 2000 + i;  // customer ID
 		long long aid = 3000 + i;  // account ID
 		long long bid = 1 + ((i - 1) % n_emp); // broker (employee) ID
-		con.Query("INSERT INTO crm_customer_mgmt VALUES("
+		MatQuery(con, "INSERT INTO crm_customer_mgmt VALUES("
 		          "TIMESTAMP '2020-01-01 00:00:00','NEW'," +
 		          std::to_string(cid) + ",'TAX" + std::to_string(i) + "',"
 		          "'M'," +
@@ -340,27 +341,27 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 		                  (hour + 1 < 10 ? "0" : "") + std::to_string(hour + 1) + ":00:00'";
 
 		// batch1_trade
-		con.Query("INSERT INTO batch1_trade VALUES('" + tid + "'," + ts + ",'ACTV','" + tt +
+		MatQuery(con, "INSERT INTO batch1_trade VALUES('" + tid + "'," + ts + ",'ACTV','" + tt +
 		          "',true,'" + sym + "'," + std::to_string(qty) + "," +
 		          std::to_string(static_cast<int>(price)) + ".0," + std::to_string(aid) +
 		          ",'Exec1'," + std::to_string(static_cast<int>(price * 1.01)) + ".0,5.0,2.0,1.5)");
 
 		// batch1_trade_history: submitted → completed
-		con.Query("INSERT INTO batch1_trade_history VALUES('" + tid + "'," + ts + ",'SBMT')");
-		con.Query("INSERT INTO batch1_trade_history VALUES('" + tid + "'," + ts2 + ",'CMPT')");
+		MatQuery(con, "INSERT INTO batch1_trade_history VALUES('" + tid + "'," + ts + ",'SBMT')");
+		MatQuery(con, "INSERT INTO batch1_trade_history VALUES('" + tid + "'," + ts2 + ",'CMPT')");
 
 		// holding history for even-indexed trades
 		if (t % 2 == 0) {
-			con.Query("INSERT INTO batch1_holding_history VALUES('" + tid + "','" + tid + "',0," +
+			MatQuery(con, "INSERT INTO batch1_holding_history VALUES('" + tid + "','" + tid + "',0," +
 			          std::to_string(qty) + ")");
 		}
 
 		// watch history: activate + cancel for every 3rd trade
 		long long watcher = 2000 + ((t - 1) % n_cust) + 1;
-		con.Query("INSERT INTO batch1_watch_history VALUES(" + std::to_string(watcher) + ",'" + sym +
+		MatQuery(con, "INSERT INTO batch1_watch_history VALUES(" + std::to_string(watcher) + ",'" + sym +
 		          "'," + ts + ",'ACTV')");
 		if (t % 3 == 0) {
-			con.Query("INSERT INTO batch1_watch_history VALUES(" + std::to_string(watcher) + ",'" + sym +
+			MatQuery(con, "INSERT INTO batch1_watch_history VALUES(" + std::to_string(watcher) + ",'" + sym +
 			          "',TIMESTAMP '2023-06-01 10:00:00','CNCL')");
 		}
 	}
@@ -371,7 +372,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 		for (int s = 1; s <= n_sec; s++) {
 			std::string sym = std::string("SYM") + (s < 10 ? "00" : s < 100 ? "0" : "") + std::to_string(s);
 			double close = 10.0 + s * 2.5 + d * 0.1;
-			con.Query("INSERT INTO batch1_daily_market VALUES(DATE '" + date + "','" + sym + "'," +
+			MatQuery(con, "INSERT INTO batch1_daily_market VALUES(DATE '" + date + "','" + sym + "'," +
 			          std::to_string(close) + "," + std::to_string(close * 1.02) + "," +
 			          std::to_string(close * 0.98) + ",100000)");
 		}
@@ -383,7 +384,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 			std::string sym = std::string("SYM") + (s < 10 ? "00" : s < 100 ? "0" : "") + std::to_string(s);
 			double close = 10.0 + s * 2.5 + d * 0.2;
 			for (const char *tbl : {"batch2_daily_market", "batch3_daily_market"})
-				con.Query(std::string("INSERT INTO ") + tbl + " VALUES(DATE '" + date + "','" + sym +
+				MatQuery(con, std::string("INSERT INTO ") + tbl + " VALUES(DATE '" + date + "','" + sym +
 				          "'," + std::to_string(close) + "," + std::to_string(close * 1.02) + "," +
 				          std::to_string(close * 0.98) + ",200000)");
 		}
@@ -396,7 +397,7 @@ void InsertTPCDIData(duckdb::Connection &con, int scale_factor) {
 		double amt = 100.0 + c * 10.0;
 		for (const char *tbl : {"batch1_cash_transaction", "batch2_cash_transaction",
 		                        "batch3_cash_transaction"})
-			con.Query(std::string("INSERT INTO ") + tbl + " VALUES(" + std::to_string(aid) +
+			MatQuery(con, std::string("INSERT INTO ") + tbl + " VALUES(" + std::to_string(aid) +
 			          ",TIMESTAMP '2023-01-15 10:00:00'," + std::to_string(amt) +
 			          ",'Settlement " + std::to_string(c) + "')");
 	}
