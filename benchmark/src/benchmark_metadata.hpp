@@ -70,7 +70,7 @@ inline std::vector<LeftoverView> ListLeftoverViews(duckdb::Connection &con, cons
                                                    const std::string &sql_like) {
 	std::vector<LeftoverView> out;
 	auto meta = MatQuery(con, "SELECT view_name, view_catalog, view_schema FROM " +
-	                      duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog) +
+	                      duckdb::SQLIdentifier::ToString(native_catalog) +
 	                      ".main.openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE " +
 	                      duckdb::Value(sql_like).ToSQLString());
 	if (meta && !meta->HasError()) {

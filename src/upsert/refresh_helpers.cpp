@@ -337,12 +337,12 @@ static string BuildFullOuterAffectedGroupsSubquery(RefreshMetadata &metadata, co
 
 	string keys_tuple = SqlUtils::JoinQuotedColumns(group_cols);
 	string affected;
-	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	string qdv = catalog_prefix + SQLIdentifier::ToString(SqlUtils::DeltaName(view_name));
 	affected = "SELECT DISTINCT " + keys_tuple + " FROM " + qdv + delta_where;
 
 	auto key_group_col = FindFullOuterJoinKeyGroupColumn(group_cols, foj);
 	if (!key_group_col.empty()) {
-		string key_col = KeywordHelper::WriteOptionallyQuoted(key_group_col);
+		string key_col = SQLIdentifier::ToString(key_group_col);
 		string changed_keys;
 		auto append_changed_keys = [&](const string &delta_table, const string &join_col, const string &where_clause) {
 			if (delta_table.empty() || join_col.empty()) {
@@ -352,8 +352,8 @@ static string BuildFullOuterAffectedGroupsSubquery(RefreshMetadata &metadata, co
 				changed_keys += "\n  UNION\n  ";
 			}
 			string q_delta = ResolveFullOuterDeltaSource(metadata, view_name, delta_table);
-			changed_keys += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(join_col) +
-			                " AS openivm_foj_key FROM " + q_delta + where_clause;
+			changed_keys += "SELECT DISTINCT " + SQLIdentifier::ToString(join_col) + " AS openivm_foj_key FROM " +
+			                q_delta + where_clause;
 		};
 		append_changed_keys(foj.dt_left_name, foj.left_col, delta_where_left);
 		append_changed_keys(foj.dt_right_name, foj.right_col, delta_where_right);
@@ -375,9 +375,8 @@ static string BuildFullOuterAffectedGroupsSubquery(RefreshMetadata &metadata, co
 			string q_left_base = SqlUtils::FullName(left_source.catalog_name, left_source.schema_name,
 			                                        BaseTableNameFromDeltaKey(left_source.table_name));
 			affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_left_base + " WHERE " +
-			            KeywordHelper::WriteOptionallyQuoted(foj.left_col) + " IN (SELECT DISTINCT " +
-			            KeywordHelper::WriteOptionallyQuoted(foj.right_col) + " FROM " + q_dt_right +
-			            delta_where_right + ")";
+			            SQLIdentifier::ToString(foj.left_col) + " IN (SELECT DISTINCT " +
+			            SQLIdentifier::ToString(foj.right_col) + " FROM " + q_dt_right + delta_where_right + ")";
 		}
 	}
 	return affected;
@@ -807,7 +806,7 @@ string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_vie
 	string where_clause = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	string delete_filter = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 	string temp_name = string(openivm::TEMP_TABLE_PREFIX) + "compact_" + view_name;
-	string qtemp = KeywordHelper::WriteOptionallyQuoted(temp_name);
+	string qtemp = SQLIdentifier::ToString(temp_name);
 	string qmul = SqlUtils::QuoteIdentifier(string(openivm::MULTIPLICITY_COL));
 
 	string sql;
@@ -847,7 +846,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
                            const string &catalog_prefix, const string &metadata_prefix, string *out_post_meta,
                            vector<string> *deferred_cleanup, const vector<string> &delta_metadata_tables,
                            const string &data_catalog) {
-	string qdt = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
+	string qdt = catalog_prefix + SQLIdentifier::ToString(IncrementalTableNames::DataTableName(view_name));
 	// parser.cpp gives AGGREGATE_GROUP / AGGREGATE_HAVING data tables a UNIQUE index on the group
 	// keys. A plain `DELETE FROM t; INSERT INTO t ...` re-inserts keys deleted in the same
 	// transaction, which DuckDB's on-disk unique index rejects, so those views need the upsert form.
@@ -924,8 +923,8 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
                                               const string &view_query_sql, const string &delta_ts_filter,
                                               const string &catalog_prefix) {
 	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
-	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
-	string rk = KeywordHelper::WriteOptionallyQuoted(string(openivm::RIGHT_KEY_COL));
+	string lk = SQLIdentifier::ToString(string(openivm::LEFT_KEY_COL));
+	string rk = SQLIdentifier::ToString(string(openivm::RIGHT_KEY_COL));
 
 	auto foj = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
 	bool dt_left_is_ducklake = !foj.dt_left_name.empty() && metadata.IsDuckLakeTable(view_name, foj.dt_left_name);
@@ -936,16 +935,16 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 	string union_parts;
 	if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
 		string dt = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_left_name);
-		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.left_col) + " AS _k FROM " + dt +
-		               delta_where_left;
+		union_parts +=
+		    "SELECT DISTINCT " + SQLIdentifier::ToString(foj.left_col) + " AS _k FROM " + dt + delta_where_left;
 	}
 	if (!foj.dt_right_name.empty() && !foj.right_col.empty()) {
 		if (!union_parts.empty()) {
 			union_parts += "\n  UNION\n  ";
 		}
 		string dt = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_right_name);
-		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.right_col) + " AS _k FROM " + dt +
-		               delta_where_right;
+		union_parts +=
+		    "SELECT DISTINCT " + SQLIdentifier::ToString(foj.right_col) + " AS _k FROM " + dt + delta_where_right;
 	}
 
 	string where_clause;
@@ -1075,7 +1074,7 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 		}
 	}
 
-	string mul = KeywordHelper::WriteOptionallyQuoted(string(openivm::MULTIPLICITY_COL));
+	string mul = SQLIdentifier::ToString(string(openivm::MULTIPLICITY_COL));
 	string delta_source = "(SELECT * FROM " + qdv;
 	if (!delta_ts_filter.empty()) {
 		delta_source += " WHERE " + delta_ts_filter;
@@ -1090,7 +1089,7 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 		if (raw_col == openivm::MULTIPLICITY_COL) {
 			continue;
 		}
-		string col = KeywordHelper::WriteOptionallyQuoted(raw_col);
+		string col = SQLIdentifier::ToString(raw_col);
 		if (!select_columns.empty()) {
 			select_columns += ", ";
 			delta_columns += ", ";
@@ -1228,9 +1227,9 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
                                              const string &view_query_sql, const string &delta_ts_filter,
                                              const string &catalog_prefix, bool can_use_runtime_delta_shape,
                                              bool nullable_side_quiet, ProjectionDeleteRetryPlan *delete_retry_plan) {
-	string qdv = catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
-	string lk = KeywordHelper::WriteOptionallyQuoted(string(openivm::LEFT_KEY_COL));
-	string mul = KeywordHelper::WriteOptionallyQuoted(string(openivm::MULTIPLICITY_COL));
+	string qdv = catalog_prefix + SQLIdentifier::ToString(SqlUtils::DeltaName(view_name));
+	string lk = SQLIdentifier::ToString(string(openivm::LEFT_KEY_COL));
+	string mul = SQLIdentifier::ToString(string(openivm::MULTIPLICITY_COL));
 	string negative_delta_guard;
 	// Primary deltas omit NULL-padding retractions when nullable-side inserts
 	// create a first match. Positive weights alone do not prove an append.
@@ -1270,7 +1269,7 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
 		if (!select_columns.empty()) {
 			select_columns += ", ";
 		}
-		select_columns += KeywordHelper::WriteOptionallyQuoted(raw_col);
+		select_columns += SQLIdentifier::ToString(raw_col);
 	}
 	string append_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
 	append_where += mul + " > 0 AND NOT (" + negative_delta_guard + ")";
@@ -1375,7 +1374,7 @@ void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &
 			if (!null_cols.empty()) {
 				null_cols += ", ";
 			}
-			null_cols += KeywordHelper::WriteOptionallyQuoted(col) + " = NULL";
+			null_cols += SQLIdentifier::ToString(col) + " = NULL";
 		}
 		upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " + source +
 		                " LIMIT 1);\n";

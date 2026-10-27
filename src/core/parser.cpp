@@ -147,11 +147,11 @@ static bool IsSameBaseColumnExpr(string expr, const string &left_alias, const st
 	string table_name = SqlUtils::LastIdentifierPart(left_table);
 	vector<string> candidates = {
 	    col_name,
-	    KeywordHelper::WriteOptionallyQuoted(col_name),
+	    SQLIdentifier::ToString(col_name),
 	    SqlUtils::QuoteIdentifier(col_name),
-	    left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name),
+	    left_alias + "." + SQLIdentifier::ToString(col_name),
 	    left_alias + "." + SqlUtils::QuoteIdentifier(col_name),
-	    table_name + "." + KeywordHelper::WriteOptionallyQuoted(col_name),
+	    table_name + "." + SQLIdentifier::ToString(col_name),
 	    table_name + "." + SqlUtils::QuoteIdentifier(col_name),
 	};
 	for (auto &candidate : candidates) {
@@ -350,10 +350,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		*metadata_schema = default_schema;
 	}
 	add_create_profile_step("create_compile_default_context", default_context_start);
-	string default_catalog_schema =
-	    KeywordHelper::WriteOptionallyQuoted(default_db) + "." + KeywordHelper::WriteOptionallyQuoted(default_schema);
-	string current_catalog_schema = KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
-	                                KeywordHelper::WriteOptionallyQuoted(current_schema);
+	string default_catalog_schema = SQLIdentifier::ToString(default_db) + "." + SQLIdentifier::ToString(default_schema);
+	string current_catalog_schema =
+	    SQLIdentifier::ToString(current_catalog) + "." + SQLIdentifier::ToString(current_schema);
 
 	if (parse_data_ref.alter_sql.empty()) {
 		// Shared metadata migrations execute before the staged lifecycle program.
@@ -503,8 +502,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Internal objects for %s use %s.%s\n", view_name.c_str(),
 	                    internal_target_catalog.c_str(), internal_target_schema.c_str());
 	string data_table = IncrementalTableNames::DataTableName(view_name);
-	string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
-	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(sql_view_name);
+	string qdt = internal_catalog_prefix + SQLIdentifier::ToString(data_table);
+	string qvn = view_catalog_prefix + SQLIdentifier::ToString(sql_view_name);
 	bool staged_cross_catalog_replace = target_is_ducklake && parse_data_ref.is_replace;
 	auto replaced_auxiliary_tables =
 	    parse_data_ref.is_replace ? metadata.GetAuxiliaryTables(view_name) : vector<string>();
@@ -517,7 +516,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                              "snapshot-published materialized views");
 	}
 	string staged_data_table = "openivm_stage_" + view_name;
-	string staged_qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(staged_data_table);
+	string staged_qdt = internal_catalog_prefix + SQLIdentifier::ToString(staged_data_table);
 	string initial_load_target = staged_cross_catalog_replace ? staged_qdt : qdt;
 	string view_query = original_view_query; // will be overwritten by LPTS for DDL
 	string top_k_suffix;                     // ORDER BY … LIMIT k, appended to the CREATE VIEW
@@ -820,8 +819,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (analysis.found_nested_aggregate &&
 	    ExtractFilteredGroupCount(local_view_query, output_names, filtered_group_count_extract)) {
 		string aux_table = "openivm_filtered_group_count_" + view_name;
-		string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
-		string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
+		string group_q = SQLIdentifier::ToString(filtered_group_count_extract.group_col);
+		string sum_q = SQLIdentifier::ToString(filtered_group_count_extract.sum_col);
 		filtered_group_count_aux_candidate = {
 		    {aux_table,
 		     QualifyCreateSourceTable(context, filtered_group_count_extract.source, facts, current_catalog,
@@ -909,8 +908,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				return false;
 			};
 			auto add_semi_anti_base_col = [&](const string &col_name) {
-				string source_expr =
-				    semi_anti_extract.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name);
+				string source_expr = semi_anti_extract.left_alias + "." + SQLIdentifier::ToString(col_name);
 				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
 					add_semi_anti_left_col(col_name);
 					add_semi_anti_expr_override(col_name, source_expr);
@@ -1110,7 +1108,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (!semi_anti_left_cols.empty()) {
 		vector<string> semi_anti_left_exprs;
 		for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
-			string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
+			string qcol = SQLIdentifier::ToString(semi_anti_left_cols[i]);
 			string source_expr = semi_anti_extract.left_alias + "." + qcol;
 			bool has_override = false;
 			for (auto &entry : semi_anti_left_expr_overrides) {
@@ -1282,13 +1280,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		if (existing != aux_state_targets.end()) {
 			return existing->second;
 		}
-		auto published_target = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(aux_table);
+		auto published_target = internal_catalog_prefix + SQLIdentifier::ToString(aux_table);
 		if (!staged_cross_catalog_replace) {
 			aux_state_targets.emplace(aux_table, published_target);
 			return published_target;
 		}
-		auto staged_target =
-		    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted("openivm_stage_" + aux_table);
+		auto staged_target = internal_catalog_prefix + SQLIdentifier::ToString("openivm_stage_" + aux_table);
 		ddl.push_back("drop table if exists " + staged_target);
 		cleanup_ddl.push_back(string(OPENIVM_DDL_CLEANUP_PREFIX) + "DROP TABLE IF EXISTS " + staged_target);
 		staged_aux_tables.emplace_back(staged_target, published_target);
@@ -1418,11 +1415,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	if (parse_data_ref.is_replace && !staged_cross_catalog_replace) {
 		add_profile_marker("create_mv_replace_cleanup");
-		string qvn_drop = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(sql_view_name);
-		string qdt_drop = internal_catalog_prefix +
-		                  KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name));
-		string qdv_drop =
-		    internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+		string qvn_drop = view_catalog_prefix + SQLIdentifier::ToString(sql_view_name);
+		string qdt_drop =
+		    internal_catalog_prefix + SQLIdentifier::ToString(IncrementalTableNames::DataTableName(view_name));
+		string qdv_drop = internal_catalog_prefix + SQLIdentifier::ToString(SqlUtils::DeltaName(view_name));
 		if (metadata_spans_databases) {
 			// The staged helper would route DROP VIEW through OpenIVM's lifecycle DROP, which
 			// also removes the view's metadata and source delta tables no other view reads,
@@ -1543,8 +1539,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs, "(" + meta.input_sql + ")", "",
 		                                   /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace);
 		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
+		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix + SQLIdentifier::ToString(meta.aux_table));
 		aux_metadata_ddl.push_back(
 		    BuildUpdateViewJsonSQL("distinct_aux_meta_json", RefreshMetadata::DistinctAuxMetaToJson(meta), view_name));
 	}
@@ -1560,8 +1555,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                                        meta.distinct_col, meta.distinct_expr, meta.filter,
 		                                        /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace);
 		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
+		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix + SQLIdentifier::ToString(meta.aux_table));
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
 		    "count_distinct_aux_meta_json", RefreshMetadata::CountDistinctAuxMetaToJson(meta), view_name));
 	}
@@ -1577,8 +1571,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    aux_target, source_table, meta.group_col, meta.sum_col, meta.source_group_expr, meta.source_sum_expr,
 		    /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace);
 		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
+		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix + SQLIdentifier::ToString(meta.aux_table));
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
 		    "aggregate_decomposition_json", RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), view_name));
 	}
@@ -1597,8 +1590,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace, meta.null_aware,
 		    meta.null_aware_right_expr);
 		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
+		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix + SQLIdentifier::ToString(meta.aux_table));
 		aux_metadata_ddl.push_back(
 		    BuildUpdateViewJsonSQL("semi_anti_aux_meta_json", RefreshMetadata::SemiAntiAuxMetaToJson(meta), view_name));
 	}
@@ -1968,7 +1960,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	// Delta table for the MV — based on the DATA table (has all columns)
 	add_profile_marker("create_mv_mv_delta_table");
-	string qdv = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	string qdv = internal_catalog_prefix + SQLIdentifier::ToString(SqlUtils::DeltaName(view_name));
 	ddl.push_back(BuildCreateDeltaFromDataOperation(qdv, qdt, staged_cross_catalog_replace));
 	if (preserve_consumer_deltas) {
 		ddl.push_back("INSERT INTO " + qdv + " BY NAME SELECT " + StringUtil::Join(replacement_delta_projection, ", ") +
@@ -2010,7 +2002,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                    SqlUtils::QuoteIdentifier(placement.table_name) + " as select *, 1::INTEGER as " +
 		                    string(openivm::MULTIPLICITY_COL) + ", " + string(openivm::UTC_NOW_SQL) + " as " +
 		                    string(openivm::TIMESTAMP_COL) + " from " + catalog_schema +
-		                    KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0";
+		                    SQLIdentifier::ToString(table_name) + " limit 0";
 		// The initial load already includes every visible source delta, including
 		// writes earlier in this transaction and changes retained for other MVs.
 		auto source_delta = delta_prefix + SqlUtils::QuoteIdentifier(placement.table_name);
@@ -2068,7 +2060,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if ((refresh_type == RefreshType::AGGREGATE_GROUP || refresh_type == RefreshType::AGGREGATE_HAVING) &&
 	    !aggregate_columns.empty() && !target_is_ducklake && (view_catalog_prefix.empty() || explicit_native)) {
 		add_profile_marker("create_view_index", "columns=" + to_string(aggregate_columns.size()));
-		string index_name = KeywordHelper::WriteOptionallyQuoted(data_table + openivm::INDEX_SUFFIX);
+		string index_name = SQLIdentifier::ToString(data_table + openivm::INDEX_SUFFIX);
 		ddl.push_back("create unique index " + index_name + " on " + qdt + "(" +
 		              SqlUtils::JoinQuotedColumns(aggregate_columns) + ")");
 	}
@@ -2122,7 +2114,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// or current_catalog. For cross-system MVs (native MV reading from dl.*),
 		// view_catalog_prefix is empty and current_catalog is the physical-default
 		// (e.g. the file DB) which doesn't have `current_snapshot()`.
-		string snapshot_catalog = KeywordHelper::WriteOptionallyQuoted(entry.first);
+		string snapshot_catalog = SQLIdentifier::ToString(entry.first);
 		ddl.push_back("UPDATE " + string(openivm::DELTA_TABLES_TABLE) + " SET last_snapshot_id = (SELECT id FROM " +
 		              snapshot_catalog + ".current_snapshot()) WHERE view_name = '" +
 		              SqlUtils::EscapeSingleQuotes(view_name) + "' AND table_name IN (" +
@@ -2385,7 +2377,7 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 		auto separator = data_ref.rfind('.');
 		internal_prefix = separator == string::npos ? "" : data_ref.substr(0, separator + 1);
 	} else {
-		data_ref = internal_prefix + KeywordHelper::WriteOptionallyQuoted(data_name);
+		data_ref = internal_prefix + SQLIdentifier::ToString(data_name);
 	}
 
 	DropInfo view_drop;
@@ -2398,8 +2390,8 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	view_drop.if_not_found = if_not_found;
 	program += BuildDropViewStatement(view_drop) + ";\n";
 	program += "DROP TABLE IF EXISTS " + data_ref + ";\n";
-	program += "DROP TABLE IF EXISTS " + internal_prefix +
-	           KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)) + ";\n";
+	program +=
+	    "DROP TABLE IF EXISTS " + internal_prefix + SQLIdentifier::ToString(SqlUtils::DeltaName(view_name)) + ";\n";
 	program += string(IsSnapshotPublication(context, location.catalog_name,
 	                                        internal_schema.empty() ? location.schema_name : internal_schema, view_name)
 	                      ? "DROP VIEW IF EXISTS "

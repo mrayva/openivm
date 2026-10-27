@@ -566,7 +566,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 				native_catalog = cur->GetValue(0, 0).ToString();
 			}
 		}
-		string quoted_native_catalog = duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog);
+		string quoted_native_catalog = duckdb::SQLIdentifier::ToString(native_catalog);
 		string native_use = "USE " + quoted_native_catalog + ".main";
 		// OpenIVM keeps control metadata in the native catalog's metadata schema
 		// (openivm_metadata_schema, main by default). Find it rather than assume main.
@@ -578,7 +578,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			if (found && !found->HasError() && found->RowCount() > 0) {
 				schema = found->GetValue(0, 0).ToString();
 			}
-			return quoted_native_catalog + "." + duckdb::KeywordHelper::WriteOptionallyQuoted(schema) + "." + table;
+			return quoted_native_catalog + "." + duckdb::SQLIdentifier::ToString(schema) + "." + table;
 		};
 
 		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.

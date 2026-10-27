@@ -652,9 +652,9 @@ static void UpdateCallerViewMetadata(ClientContext &context, const MetadataLocat
 			row_ids.SetValue(0, rows.GetValue(1, row));
 			DataChunk updates;
 			updates.Initialize(Allocator::Get(context), types);
-			updates.SetCardinality(1);
+			updates.SetCardinalityUnsafe(1);
 			for (idx_t col = 0; col < values.size(); col++) {
-				updates.SetValue(col, 0, values[col]);
+				updates.data[col].SetValue(0, values[col]);
 			}
 			vector<unique_ptr<BoundConstraint>> constraints;
 			auto state = storage.InitializeUpdate(entry, context, constraints);

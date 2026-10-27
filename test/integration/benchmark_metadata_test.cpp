@@ -23,7 +23,7 @@ static void Check(bool condition, const string &message) {
 
 // The obsolete benchmark lookup: matching the SQL-facing name against the internal key column.
 static idx_t LegacyLookupRows(Connection &con, const string &native_catalog, const string &name) {
-	auto result = MatQuery(con, "SELECT type FROM " + KeywordHelper::WriteOptionallyQuoted(native_catalog) +
+	auto result = MatQuery(con, "SELECT type FROM " + SQLIdentifier::ToString(native_catalog) +
 	                                ".main.openivm_views WHERE view_name = " + Value(name).ToSQLString());
 	Check(!result->HasError(), "legacy lookup failed to run: " + result->GetError());
 	return result->RowCount();

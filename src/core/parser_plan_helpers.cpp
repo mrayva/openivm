@@ -440,8 +440,7 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
 	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema)) {
 		return table_name;
 	}
-	return KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
-	       KeywordHelper::WriteOptionallyQuoted(current_schema) + "." + table_name;
+	return SQLIdentifier::ToString(current_catalog) + "." + SQLIdentifier::ToString(current_schema) + "." + table_name;
 }
 
 static string StripTrailingSemicolon(string sql) {
@@ -2757,13 +2756,13 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	string sch = sti->second.schema_name;
 	string qual;
 	if (!cat.empty()) {
-		qual += KeywordHelper::WriteOptionallyQuoted(cat) + ".";
+		qual += SQLIdentifier::ToString(cat) + ".";
 	}
 	if (!sch.empty()) {
-		qual += KeywordHelper::WriteOptionallyQuoted(sch) + ".";
+		qual += SQLIdentifier::ToString(sch) + ".";
 	}
-	string inner_base = qual + KeywordHelper::WriteOptionallyQuoted(inner_table);
-	string qcol = KeywordHelper::WriteOptionallyQuoted(inner_col);
+	string inner_base = qual + SQLIdentifier::ToString(inner_table);
+	string qcol = SQLIdentifier::ToString(inner_col);
 
 	// The correction below assumes a dangling (null-padded) row for this key is ALREADY materialized
 	// in the view -- true only if the preserved-side row (e.g. the order) existed before this refresh
@@ -2795,13 +2794,13 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	}
 	string pres_qual;
 	if (!pres_sti->second.catalog_name.empty()) {
-		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.catalog_name) + ".";
+		pres_qual += SQLIdentifier::ToString(pres_sti->second.catalog_name) + ".";
 	}
 	if (!pres_sti->second.schema_name.empty()) {
-		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.schema_name) + ".";
+		pres_qual += SQLIdentifier::ToString(pres_sti->second.schema_name) + ".";
 	}
-	string pres_base = pres_qual + KeywordHelper::WriteOptionallyQuoted(pres_table);
-	string pres_qcol = KeywordHelper::WriteOptionallyQuoted(pres_col);
+	string pres_base = pres_qual + SQLIdentifier::ToString(pres_table);
+	string pres_qcol = SQLIdentifier::ToString(pres_col);
 
 	// Classify each aggregate output column's contribution to a null-padded row of the deepest join.
 	// output_names layout: [group cols (G)] [visible aggregates (agg.expressions, in order)] [hidden helpers].
@@ -2923,11 +2922,11 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	string col_list;
 	string sel;
 	for (size_t gi = 0; gi < G; gi++) {
-		col_list += KeywordHelper::WriteOptionallyQuoted(output_names[gi]) + ", ";
+		col_list += SQLIdentifier::ToString(output_names[gi]) + ", ";
 		sel += "X.\"__g" + std::to_string(gi) + "\", ";
 	}
 	for (size_t j = 0; j < contribs.size(); j++) {
-		col_list += KeywordHelper::WriteOptionallyQuoted(output_names[G + j]) + ", ";
+		col_list += SQLIdentifier::ToString(output_names[G + j]) + ", ";
 		sel += contribs[j] + ", ";
 	}
 	col_list += "openivm_multiplicity";
@@ -2941,7 +2940,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
 	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
 	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
-	string dmv = delta_view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name));
+	string dmv = delta_view_catalog_prefix + SQLIdentifier::ToString(SqlUtils::DeltaName(view_name));
 	// The two delta row sources are placeholders resolved at refresh: a regular table reads its
 	// openivm_delta_<table>, a DuckLake table reads ducklake_table_insertions/deletions between
 	// snapshots (whose IDs only exist at refresh time). Both substitutions yield columns (__k, __m).

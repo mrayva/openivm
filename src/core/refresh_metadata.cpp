@@ -916,7 +916,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			}
 			UnifiedVectorFormat names;
 			if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
-				rows.data[positions[0].GetIndex()].ToUnifiedFormat(rows.size(), names);
+				rows.data[positions[0].GetIndex()].ToUnifiedFormat(names);
 			}
 			for (idx_t row = 0; row < rows.size(); row++) {
 				if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
@@ -1038,7 +1038,7 @@ static void DeleteRegistryRows(ClientContext &context, TableCatalogEntry &entry,
 			if (matches(rows, row)) {
 				row_ids.SetValue(count, rows.GetValue(types.size() - 1, row));
 				for (idx_t column = 0; column + 1 < types.size(); column++) {
-					deleted.SetValue(column, count, rows.GetValue(column, row));
+					deleted.data[column].SetValue(count, rows.GetValue(column, row));
 				}
 				count++;
 			}
@@ -1048,7 +1048,7 @@ static void DeleteRegistryRows(ClientContext &context, TableCatalogEntry &entry,
 			                                             DatabaseModificationType::DELETE_DATA);
 			LocalAppendState append_state;
 			storage.InitializeLocalStorage(append_state, entry.Cast<DuckTableEntry>(), context, constraints);
-			deleted.SetCardinality(count);
+			deleted.SetCardinalityUnsafe(count);
 			LocalStorage::Get(context, entry.catalog).GetStorage(storage)->AppendToDeleteIndexes(row_ids, deleted);
 			storage.Delete(*state, context, entry.Cast<DuckTableEntry>(), row_ids, count);
 		}
@@ -1746,7 +1746,7 @@ string RefreshMetadata::BuildDeltaConsumersSQL(const string &target, const strin
                                                const string &delta_metadata_table,
                                                const vector<string> &delta_metadata_tables,
                                                const string &source_catalog, const string &source_schema) {
-	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
+	string qtarget = target.find('.') == string::npos ? SQLIdentifier::ToString(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
 	                 SqlUtils::EscapeValue(metadata_key) + "'";
@@ -1769,7 +1769,7 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
                                              const string &delta_metadata_table, vector<string> *deferred_cleanup,
                                              const vector<string> &delta_metadata_tables, const string &source_catalog,
                                              const string &source_schema, const string &data_catalog) {
-	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
+	string qtarget = target.find('.') == string::npos ? SQLIdentifier::ToString(target) : target;
 	auto consumers = BuildDeltaConsumersSQL(qtarget, metadata_key, delta_metadata_table, delta_metadata_tables,
 	                                        source_catalog, source_schema);
 	auto sql = "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +

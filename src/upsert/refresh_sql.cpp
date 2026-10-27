@@ -465,7 +465,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// or a source stored in the metadata catalog) is collected and runs after the watermarks.
 	const string cleanup_data_catalog = cross_system ? internal_catalog_name : string();
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
-	string data_table = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
+	string data_table = internal_catalog_prefix + SQLIdentifier::ToString(data_table_bare);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Looking up delta view '%s' in catalog '%s.%s'\n",
 	                    SqlUtils::DeltaName(view_name).c_str(), view_catalog_name.c_str(), view_schema_name.c_str());
 	optional_ptr<TableCatalogEntry> delta_view_catalog_entry;
@@ -1397,9 +1397,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		}
 
 		string temp_name = string(openivm::TEMP_TABLE_PREFIX) + view_name;
-		string qt = KeywordHelper::WriteOptionallyQuoted(temp_name);
-		string qdvn = delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
-		                                                        : delta_view_name;
+		string qt = SQLIdentifier::ToString(temp_name);
+		string qdvn =
+		    delta_view_name.find('.') == string::npos ? SQLIdentifier::ToString(delta_view_name) : delta_view_name;
 		const string &qdt = data_table;
 		string user_cols;
 		for (auto &col : column_names) {
@@ -1455,8 +1455,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 		}
 
-		string qdvn = delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
-		                                                        : delta_view_name;
+		string qdvn =
+		    delta_view_name.find('.') == string::npos ? SQLIdentifier::ToString(delta_view_name) : delta_view_name;
 		pre_companion = "DELETE FROM " + qdvn + " WHERE 1=1";
 		if (!delta_ts_filter.empty()) {
 			pre_companion += " AND " + delta_ts_filter;
@@ -1488,12 +1488,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			}
 		}
 
-		string qdvn = delta_view_name.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(delta_view_name)
-		                                                        : delta_view_name;
-		string affected_temp =
-		    KeywordHelper::WriteOptionallyQuoted(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name);
-		string old_temp =
-		    KeywordHelper::WriteOptionallyQuoted(string(openivm::TEMP_TABLE_PREFIX) + "snapshot_" + view_name);
+		string qdvn =
+		    delta_view_name.find('.') == string::npos ? SQLIdentifier::ToString(delta_view_name) : delta_view_name;
+		string affected_temp = SQLIdentifier::ToString(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name);
+		string old_temp = SQLIdentifier::ToString(string(openivm::TEMP_TABLE_PREFIX) + "snapshot_" + view_name);
 		string key_cols = SqlUtils::JoinQuotedColumns(keys);
 		string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 		string target_match = SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_data");

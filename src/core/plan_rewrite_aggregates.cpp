@@ -202,11 +202,11 @@ void InjectSumNonNullCounts(ClientContext &context, unique_ptr<LogicalOperator> 
 	};
 	vector<SumCountOutput> outputs;
 	for (idx_t projection_index = 0; projection_index < output_projection.expressions.size(); projection_index++) {
-		Expression *resolved = output_projection.expressions[projection_index].get();
+		const Expression *resolved = output_projection.expressions[projection_index].get();
 		while (resolved) {
 			while (BoundCastExpression::IsCast(*resolved)) {
 				auto &cast = resolved->Cast<BoundFunctionExpression>();
-				resolved = const_cast<Expression *>(&BoundCastExpression::Child(cast));
+				resolved = &BoundCastExpression::Child(cast);
 			}
 			if (resolved->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
 				break;

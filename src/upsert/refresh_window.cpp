@@ -497,12 +497,11 @@ static string BuildSingleSourceDuckLakeWindowRefresh(
 			affected_select += ", ";
 		}
 		auto parsed = SplitPartitionSpec(partition_cols[i]);
-		affected_cols += KeywordHelper::WriteOptionallyQuoted(parsed.first);
-		affected_select += KeywordHelper::WriteOptionallyQuoted(parsed.second) + " AS " +
-		                   KeywordHelper::WriteOptionallyQuoted(parsed.first);
+		affected_cols += SQLIdentifier::ToString(parsed.first);
+		affected_select += SQLIdentifier::ToString(parsed.second) + " AS " + SQLIdentifier::ToString(parsed.first);
 	}
 	string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
-	string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
+	string qtemp_affected = SQLIdentifier::ToString(temp_affected);
 	string insertions = "SELECT " + affected_select + " FROM " +
 	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
 	                                                    loc.table_name, old_snap, current_snap);
@@ -538,7 +537,7 @@ static string BuildMultiSourceDuckLakeWindowRefresh(
 	                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
 	                                        attached_db_schema_name, affected_keys, key_cols)) {
 		string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
-		string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
+		string qtemp_affected = SQLIdentifier::ToString(temp_affected);
 		OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake lineage change-feed, %zu "
 		                    "sources)\n",
 		                    delta_table_names.size());
@@ -554,7 +553,7 @@ static string BuildMultiSourceDuckLakeWindowRefresh(
 			key_cols += ", ";
 		}
 		auto parsed = SplitPartitionSpec(partition_cols[i]);
-		string output_col = KeywordHelper::WriteOptionallyQuoted(parsed.first);
+		string output_col = SQLIdentifier::ToString(parsed.first);
 		key_cols += output_col;
 	}
 	string current_rows = "SELECT * FROM (" + view_query_sql + ") openivm_current_rows";
@@ -564,7 +563,7 @@ static string BuildMultiSourceDuckLakeWindowRefresh(
 	string changed_rows = "((" + current_rows + ") EXCEPT ALL (" + old_rows + ")) UNION ALL ((" + old_rows +
 	                      ") EXCEPT ALL (" + current_rows + "))";
 	string temp_affected = string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name;
-	string qtemp_affected = KeywordHelper::WriteOptionallyQuoted(temp_affected);
+	string qtemp_affected = SQLIdentifier::ToString(temp_affected);
 	string fallback_affected_keys = "SELECT DISTINCT " + key_cols + " FROM (" + changed_rows + ") openivm_changed_rows";
 	OPENIVM_DEBUG_PRINT("[UPSERT] Compiling upsert for type: WINDOW_PARTITION (DuckLake view-diff, %zu "
 	                    "partition cols, %zu sources)\n",

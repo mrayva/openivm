@@ -738,8 +738,8 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 		return;
 	}
 	ExecuteDDL(context, bind_data.ddl);
-	output.SetValue(0, 0, Value::BOOLEAN(bind_data.result));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(bind_data.result));
+	output.SetCardinalityUnsafe(1);
 	gdata.offset++;
 }
 
@@ -1182,8 +1182,8 @@ public:
 		if (staged) {
 			MutationLockGuard guard(client);
 			ExecuteStagedDDL(client, {Value(program)});
-			chunk.SetValue(0, 0, Value::BOOLEAN(true));
-			chunk.SetCardinality(1);
+			chunk.data[0].SetValue(0, Value::BOOLEAN(true));
+			chunk.SetCardinalityUnsafe(1);
 			state.finished = true;
 			return SourceResultType::FINISHED;
 		}
@@ -1273,8 +1273,8 @@ public:
 			throw;
 		}
 		state.metrics.reset();
-		chunk.SetValue(0, 0, Value::BOOLEAN(true));
-		chunk.SetCardinality(1);
+		chunk.data[0].SetValue(0, Value::BOOLEAN(true));
+		chunk.SetCardinalityUnsafe(1);
 		state.finished = true;
 		return SourceResultType::FINISHED;
 	}
@@ -1505,8 +1505,8 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 		OPENIVM_DEBUG_PRINT("[DROP] Recorded transaction-local source delta removal %s\n",
 		                    SqlUtils::FullName(info.catalog, info.schema, info.name).c_str());
 	}
-	output.SetValue(0, 0, Value::BOOLEAN(true));
-	output.SetCardinality(1);
+	output.data[0].SetValue(0, Value::BOOLEAN(true));
+	output.SetCardinalityUnsafe(1);
 	state.finished = true;
 }
 

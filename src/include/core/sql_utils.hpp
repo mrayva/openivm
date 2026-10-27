@@ -100,7 +100,7 @@ public:
 
 	/// Quote an identifier for safe use in generated SQL (handles reserved words and special chars).
 	static string QuoteIdentifier(const string &name) {
-		return KeywordHelper::WriteOptionallyQuoted(name);
+		return SQLIdentifier::ToString(name);
 	}
 
 	/// Escape a string value for use inside single-quoted SQL literals.
