@@ -6,5 +6,8 @@ duckdb_extension_load(openivm
     LOAD_TESTS
 )
 
+# DuckDB 2.0 only links extensions listed here into the shell/unittest binaries
+duckdb_extension_statically_link(openivm)
+
 # Any extra extensions that should be built
 # e.g.: duckdb_extension_load(json)
