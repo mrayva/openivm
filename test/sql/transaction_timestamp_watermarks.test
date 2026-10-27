@@ -1,0 +1,176 @@
+# name: test/sql/transaction_timestamp_watermarks.test
+# description: Views created, mutated and refreshed inside one transaction keep correct delta timestamp watermarks
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE TABLE tw_src (id INT, grp VARCHAR, v INT);
+
+statement ok
+INSERT INTO tw_src SELECT i, 'g' || (i % 3)::VARCHAR, i FROM range(0, 12) t(i);
+
+# Everything below happens in one transaction: creation records a later wall-clock watermark than the
+# transaction-stable now() that stamps the deltas, so a refresh must not filter its own rows out.
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW tw_agg AS SELECT grp, SUM(v) AS s, COUNT(*) AS c FROM tw_src GROUP BY grp;
+
+statement ok
+CREATE MATERIALIZED VIEW tw_proj AS SELECT id, v FROM tw_src WHERE v % 2 = 0;
+
+# MAX under deletes takes the group-recompute path.
+statement ok
+CREATE MATERIALIZED VIEW tw_full AS SELECT grp, MAX(v) AS m FROM tw_src GROUP BY grp;
+
+statement ok
+INSERT INTO tw_src VALUES (100, 'g0', 5), (101, 'g1', 6), (102, 'g9', 7), (103, 'g0', 8);
+
+statement ok
+DELETE FROM tw_src WHERE id IN (1, 2, 101);
+
+statement ok
+UPDATE tw_src SET v = v + 10 WHERE grp = 'g0';
+
+statement ok
+INSERT INTO tw_src VALUES (101, 'g1', 60);
+
+statement ok
+DELETE FROM tw_src WHERE id = 103;
+
+statement ok
+PRAGMA refresh('tw_agg');
+
+statement ok
+PRAGMA refresh('tw_proj');
+
+statement ok
+PRAGMA refresh('tw_full');
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_agg EXCEPT ALL SELECT grp, SUM(v), COUNT(*) FROM tw_src GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, SUM(v), COUNT(*) FROM tw_src GROUP BY grp EXCEPT ALL SELECT * FROM tw_agg);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_proj EXCEPT ALL SELECT id, v FROM tw_src WHERE v % 2 = 0);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, v FROM tw_src WHERE v % 2 = 0 EXCEPT ALL SELECT * FROM tw_proj);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_full EXCEPT ALL SELECT grp, MAX(v) FROM tw_src GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, MAX(v) FROM tw_src GROUP BY grp EXCEPT ALL SELECT * FROM tw_full);
+----
+0
+
+statement ok
+COMMIT;
+
+# After commit the watermark must advance: new batched DML is picked up exactly once.
+statement ok
+INSERT INTO tw_src VALUES (200, 'g2', 1), (201, 'g2', 2), (202, 'g3', 3);
+
+statement ok
+DELETE FROM tw_src WHERE id IN (200, 4);
+
+statement ok
+UPDATE tw_src SET v = v * 2 WHERE grp = 'g2';
+
+statement ok
+PRAGMA refresh('tw_agg');
+
+statement ok
+PRAGMA refresh('tw_proj');
+
+statement ok
+PRAGMA refresh('tw_full');
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_agg EXCEPT ALL SELECT grp, SUM(v), COUNT(*) FROM tw_src GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, SUM(v), COUNT(*) FROM tw_src GROUP BY grp EXCEPT ALL SELECT * FROM tw_agg);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_proj EXCEPT ALL SELECT id, v FROM tw_src WHERE v % 2 = 0);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, v FROM tw_src WHERE v % 2 = 0 EXCEPT ALL SELECT * FROM tw_proj);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_full EXCEPT ALL SELECT grp, MAX(v) FROM tw_src GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, MAX(v) FROM tw_src GROUP BY grp EXCEPT ALL SELECT * FROM tw_full);
+----
+0
+
+# A second refresh with no new DML is a no-op and must not double-apply anything.
+statement ok
+PRAGMA refresh('tw_agg');
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_agg EXCEPT ALL SELECT grp, SUM(v), COUNT(*) FROM tw_src GROUP BY grp);
+----
+0
+
+# A view whose own deltas are consumed inside the creating transaction (cascade).
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW tw_chain AS SELECT grp, s FROM tw_agg WHERE s > 0;
+
+statement ok
+INSERT INTO tw_src VALUES (300, 'g0', 1000), (301, 'g7', 2);
+
+statement ok
+DELETE FROM tw_src WHERE id = 5;
+
+statement ok
+PRAGMA refresh('tw_agg');
+
+statement ok
+PRAGMA refresh('tw_chain');
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_chain EXCEPT ALL SELECT grp, SUM(v) FROM tw_src GROUP BY grp HAVING SUM(v) > 0);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, SUM(v) FROM tw_src GROUP BY grp HAVING SUM(v) > 0 EXCEPT ALL SELECT * FROM tw_chain);
+----
+0
+
+statement ok
+COMMIT;
