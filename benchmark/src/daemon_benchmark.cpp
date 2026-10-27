@@ -827,7 +827,9 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 	ctx.disable_daemon = false;
 
 	try {
-		ctx.db = std::make_shared<duckdb::DuckDB>(db_path);
+		duckdb::DBConfig db_config;
+		openivm_bench::AllowUnsignedExtensions(db_config);
+		ctx.db = std::make_shared<duckdb::DuckDB>(db_path, &db_config);
 		openivm_bench::LoadCoreFunctions(*ctx.db);
 		duckdb::Connection con(*ctx.db);
 		MatQuery(con, "PRAGMA threads=4");

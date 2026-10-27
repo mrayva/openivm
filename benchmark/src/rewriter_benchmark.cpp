@@ -535,7 +535,9 @@ static string TruncateError(const string &error) {
 static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, const vector<string> &deltas,
                             const string &workload) {
 	try {
-		duckdb::DuckDB db(db_path);
+		duckdb::DBConfig config;
+		openivm_bench::AllowUnsignedExtensions(config);
+		duckdb::DuckDB db(db_path, &config);
 		openivm_bench::LoadCoreFunctions(db);
 		db.LoadStaticExtension<duckdb::OpenivmExtension>();
 		duckdb::Connection con(db);

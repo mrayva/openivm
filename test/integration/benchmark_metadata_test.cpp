@@ -48,7 +48,9 @@ int main(int argc, char **argv) {
 	}
 	try {
 		string dir = SqlUtils::EscapeValue(argv[1]);
-		DuckDB db(string(argv[1]) + "/native.db");
+		DBConfig config;
+		config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		DuckDB db(string(argv[1]) + "/native.db", &config);
 		Connection con(db);
 		Execute(con, "LOAD openivm; LOAD ducklake; SET openivm_files_path='" + dir + "'");
 		auto native = MatQuery(con, "SELECT current_database()");

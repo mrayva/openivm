@@ -15,6 +15,11 @@
 
 namespace openivm_bench {
 
+// ducklake and other locally built extensions are unsigned.
+inline void AllowUnsignedExtensions(duckdb::DBConfig &config) {
+	config.SetOptionByName("allow_unsigned_extensions", duckdb::Value::BOOLEAN(true));
+}
+
 std::string Timestamp();
 void Log(const std::string &msg);
 

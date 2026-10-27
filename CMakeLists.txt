@@ -141,14 +141,18 @@ if(NOT EMSCRIPTEN)
     list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
   endif()
 
-  add_executable(scheduler_catalog_test
-                 test/integration/scheduler_catalog_test.cpp)
-  target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
+  add_executable(
+    scheduler_catalog_test test/integration/scheduler_catalog_test.cpp
+                           test/integration/register_loadable_extensions.cpp)
+  target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS}
+                        duckdb_loadable_extensions)
   duckdb_link_extensions(scheduler_catalog_test openivm core_functions parquet)
 
-  add_executable(benchmark_metadata_test
-                 test/integration/benchmark_metadata_test.cpp)
-  target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS})
+  add_executable(
+    benchmark_metadata_test test/integration/benchmark_metadata_test.cpp
+                            test/integration/register_loadable_extensions.cpp)
+  target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS}
+                        duckdb_loadable_extensions)
   duckdb_link_extensions(benchmark_metadata_test openivm core_functions parquet)
   target_include_directories(benchmark_metadata_test PUBLIC benchmark/src)
 
@@ -187,15 +191,20 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
   target_include_directories(tpcdi_helpers PUBLIC benchmark/src)
 
   # IVM query benchmark harness (supports --workload tpcc|tpcdi)
-  add_executable(rewriter_benchmark benchmark/src/rewriter_benchmark.cpp)
+  add_executable(
+    rewriter_benchmark benchmark/src/rewriter_benchmark.cpp
+                       test/integration/register_loadable_extensions.cpp)
   target_link_libraries(rewriter_benchmark tpcc_helpers tpcdi_helpers
-                        ${OPENIVM_LINK_LIBS})
+                        ${OPENIVM_LINK_LIBS} duckdb_loadable_extensions)
   duckdb_link_extensions(rewriter_benchmark openivm core_functions parquet)
   target_include_directories(rewriter_benchmark PUBLIC benchmark benchmark/src)
 
   # Refresh-daemon / cascade / pipeline benchmark
-  add_executable(daemon_benchmark benchmark/src/daemon_benchmark.cpp)
-  target_link_libraries(daemon_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+  add_executable(
+    daemon_benchmark benchmark/src/daemon_benchmark.cpp
+                     test/integration/register_loadable_extensions.cpp)
+  target_link_libraries(daemon_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS}
+                        duckdb_loadable_extensions)
   duckdb_link_extensions(daemon_benchmark openivm core_functions parquet)
   target_include_directories(daemon_benchmark PUBLIC benchmark benchmark/src)
 

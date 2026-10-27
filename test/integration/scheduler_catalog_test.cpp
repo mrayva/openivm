@@ -17,7 +17,9 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 	try {
-		DuckDB db(nullptr);
+		DBConfig config;
+		config.SetOptionByName("allow_unsigned_extensions", Value::BOOLEAN(true));
+		DuckDB db(nullptr, &config);
 		Connection con(db);
 		auto path = SqlUtils::EscapeValue(argv[1]);
 		Execute(con, "LOAD openivm; LOAD ducklake; SET openivm_files_path='" + path +
