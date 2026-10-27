@@ -1108,6 +1108,41 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
 	AppendMultiplicityToAncestorProjectionMaps(term, leaf.path, mul_binding, "DeltaJoin");
 }
 
+void RemapParentProjectionMapForProjectedGet(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
+                                             const vector<ProjectionIndex> &projection_ids) {
+	if (leaf_path.empty() || projection_ids.empty()) {
+		return;
+	}
+	LogicalOperator *parent = term.get();
+	for (size_t depth = 0; depth + 1 < leaf_path.size(); depth++) {
+		if (leaf_path[depth] >= parent->children.size()) {
+			return;
+		}
+		parent = parent->children[leaf_path[depth]].get();
+	}
+	auto *join = dynamic_cast<LogicalJoin *>(parent);
+	if (!join || leaf_path.back() >= join->children.size()) {
+		return;
+	}
+	auto &projection_map = leaf_path.back() == 0 ? join->left_projection_map : join->right_projection_map;
+	vector<ProjectionIndex> remapped;
+	if (projection_map.empty()) {
+		remapped = projection_ids;
+	} else {
+		for (auto &projected_idx : projection_map) {
+			idx_t idx = projected_idx.GetIndexUnsafe();
+			if (idx >= projection_ids.size()) {
+				throw InternalException("DeltaJoin: stale projection map index %llu for projected width %llu",
+				                        static_cast<idx_t>(idx), static_cast<idx_t>(projection_ids.size()));
+			}
+			remapped.push_back(projection_ids[idx]);
+		}
+	}
+	OPENIVM_DEBUG_PRINT("[DeltaJoin] Remapped parent projection map for projected GET (%zu entries)\n",
+	                    remapped.size());
+	projection_map = std::move(remapped);
+}
+
 void RemapParentProjectionMapForInsertedOutput(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                idx_t original_child_width, const ColumnBinding &mul_binding) {
 	if (leaf_path.empty()) {

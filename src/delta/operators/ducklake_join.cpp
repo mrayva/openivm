@@ -472,8 +472,13 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		if (flattened_leaves || delta_get) {
 			// Simple GET leaf — replace directly.
 			D_ASSERT(delta_get);
+			auto leaf_projection_ids = delta_get->projection_ids;
 			DeltaGetResult delta_result =
 			    CreateDeltaGetNode(context, input.context.metadata_con, binder, delta_get, input.context.view);
+			// An empty delta already has the projected width; only real change scans emit every column_id.
+			if (delta_result.node->type != LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+				RemapParentProjectionMapForProjectedGet(term, leaves[i].path, leaf_projection_ids);
+			}
 			mul_binding = delta_result.mul_binding;
 			delta_leaf_node = std::move(delta_result.node);
 			if (flattened_leaves) {

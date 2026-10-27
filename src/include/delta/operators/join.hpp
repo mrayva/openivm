@@ -24,6 +24,12 @@ void DemoteLeftJoins(LogicalOperator *node);
 void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeafInfo &leaf,
                                const ColumnBinding &mul_binding);
 
+/// A delta scan emits every column_id of the replaced LogicalGet, while the original scan only exposed
+/// projection_ids. Translate the parent join's projection map from projected positions to column_id positions
+/// (installing one when the map is empty) so the join keeps exposing exactly the original columns.
+void RemapParentProjectionMapForProjectedGet(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
+                                             const vector<ProjectionIndex> &projection_ids);
+
 void RemapParentProjectionMapForInsertedOutput(unique_ptr<LogicalOperator> &term, const vector<size_t> &leaf_path,
                                                idx_t original_child_width, const ColumnBinding &mul_binding);
 

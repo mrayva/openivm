@@ -1280,3 +1280,79 @@ DROP SCHEMA dl.source_a CASCADE;
 
 statement ok
 DROP SCHEMA dl.source_b CASCADE;
+
+# ==========================================
+# Filter on a column that is not projected, inserts on both join sides
+# (delta scan emits the filter-only column; parent join projection map must be remapped)
+# ==========================================
+
+statement ok
+CREATE TABLE dl.fnp_cust (w INT, d INT, id INT, last VARCHAR, bal INT);
+
+statement ok
+CREATE TABLE dl.fnp_ord (w INT, d INT, id INT, cid INT, ts VARCHAR);
+
+statement ok
+INSERT INTO dl.fnp_cust VALUES (1, 1, 1, 'a', 10), (1, 1, 2, 'b', -5), (1, 2, 3, 'c', 7);
+
+statement ok
+INSERT INTO dl.fnp_ord VALUES (1, 1, 100, 1, 'x'), (1, 1, 101, 2, 'y'), (1, 2, 102, 3, 'z');
+
+statement ok
+CREATE MATERIALIZED VIEW dl.fnp_mv AS
+    SELECT c.w, c.d, c.id, c.last, o.id AS oid, o.ts
+    FROM dl.fnp_cust c JOIN dl.fnp_ord o ON c.w = o.w AND c.d = o.d AND c.id = o.cid
+    WHERE c.bal > 0;
+
+# Phase 1: plain inserts on both sides, filter column (bal) is not projected.
+statement ok
+INSERT INTO dl.fnp_cust VALUES (3, 1, 1, 'z', 9);
+
+statement ok
+INSERT INTO dl.fnp_ord VALUES (3, 1, 50, 1, 'n');
+
+statement ok
+PRAGMA refresh('fnp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM dl.fnp_mv EXCEPT ALL
+     SELECT c.w, c.d, c.id, c.last, o.id, o.ts FROM dl.fnp_cust c JOIN dl.fnp_ord o ON c.w = o.w AND c.d = o.d AND c.id = o.cid WHERE c.bal > 0)
+    UNION ALL
+    (SELECT c.w, c.d, c.id, c.last, o.id, o.ts FROM dl.fnp_cust c JOIN dl.fnp_ord o ON c.w = o.w AND c.d = o.d AND c.id = o.cid WHERE c.bal > 0
+     EXCEPT ALL SELECT * FROM dl.fnp_mv)
+);
+----
+0
+
+# Phase 2: Batched inserts on both sides, plus a delete and an update that flips the filter.
+statement ok
+INSERT INTO dl.fnp_cust VALUES (2, 1, 4, 'd', 3), (2, 1, 5, 'e', -1);
+
+statement ok
+INSERT INTO dl.fnp_ord VALUES (2, 1, 103, 4, 'p'), (2, 1, 104, 5, 'q'), (1, 1, 105, 1, 'r');
+
+statement ok
+DELETE FROM dl.fnp_ord WHERE id = 102;
+
+statement ok
+UPDATE dl.fnp_cust SET bal = 9 WHERE id = 2;
+
+statement ok
+PRAGMA refresh('fnp_mv');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM dl.fnp_mv EXCEPT ALL
+     SELECT c.w, c.d, c.id, c.last, o.id, o.ts FROM dl.fnp_cust c JOIN dl.fnp_ord o ON c.w = o.w AND c.d = o.d AND c.id = o.cid WHERE c.bal > 0)
+    UNION ALL
+    (SELECT c.w, c.d, c.id, c.last, o.id, o.ts FROM dl.fnp_cust c JOIN dl.fnp_ord o ON c.w = o.w AND c.d = o.d AND c.id = o.cid WHERE c.bal > 0
+     EXCEPT ALL SELECT * FROM dl.fnp_mv)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM dl.fnp_mv;
+----
+5
