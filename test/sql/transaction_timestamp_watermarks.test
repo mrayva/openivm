@@ -82,6 +82,56 @@ SELECT count(*) FROM (SELECT grp, MAX(v) FROM tw_src GROUP BY grp EXCEPT ALL SEL
 ----
 0
 
+# A second batch and refresh in the same transaction: the new deltas carry the same transaction-stable
+# timestamp as the first batch, so the watermark left by the first refresh must not hide them.
+statement ok
+INSERT INTO tw_src VALUES (110, 'g1', 11), (111, 'g2', 12), (112, 'g0', 13);
+
+statement ok
+DELETE FROM tw_src WHERE id IN (110, 6);
+
+statement ok
+UPDATE tw_src SET v = v + 1 WHERE id = 111;
+
+statement ok
+PRAGMA refresh('tw_agg');
+
+statement ok
+PRAGMA refresh('tw_proj');
+
+statement ok
+PRAGMA refresh('tw_full');
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_agg EXCEPT ALL SELECT grp, SUM(v), COUNT(*) FROM tw_src GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, SUM(v), COUNT(*) FROM tw_src GROUP BY grp EXCEPT ALL SELECT * FROM tw_agg);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_proj EXCEPT ALL SELECT id, v FROM tw_src WHERE v % 2 = 0);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT id, v FROM tw_src WHERE v % 2 = 0 EXCEPT ALL SELECT * FROM tw_proj);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM tw_full EXCEPT ALL SELECT grp, MAX(v) FROM tw_src GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, MAX(v) FROM tw_src GROUP BY grp EXCEPT ALL SELECT * FROM tw_full);
+----
+0
+
 statement ok
 COMMIT;
 
