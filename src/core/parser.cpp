@@ -2602,6 +2602,12 @@ struct TrackedDropProgram {
 // cleanup program before any physical drop, so shared source deltas are tested
 // against the complete set of removed consumers across metadata catalogs.
 static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info, bool defer_native_execution) {
+	// DuckLake maintains its own metadata catalog through internal DROPs; they are never tracked sources.
+	if (StringUtil::StartsWith(drop_info.GetQualifiedName().Catalog().GetIdentifierName(), "__ducklake_metadata_")) {
+		return (drop_info.type == CatalogType::SCHEMA_ENTRY ? BuildDropSchemaStatement(drop_info)
+		                                                    : BuildDropTableStatement(drop_info)) +
+		       ";\n";
+	}
 	unique_ptr<MutationLockGuard> autocommit_guard;
 	if (context.transaction.IsAutoCommit() && !defer_native_execution) {
 		autocommit_guard = make_uniq<MutationLockGuard>(context);
