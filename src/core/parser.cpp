@@ -697,12 +697,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	const bool semi_anti_query_extracted = analysis.found_semi_anti_join &&
 	                                      ExtractSemiAntiQuery(local_view_query, semi_anti_extract);
-	const bool only_unnest_decorrelation_aggregates = facts.ducklake_table_info.empty() &&
-	                                                 analysis.found_aggregation &&
+	const bool only_unnest_decorrelation_aggregates = analysis.found_aggregation &&
 	                                                 AggregatesAreUnnestDecorrelationOnly(facts);
 	if (only_unnest_decorrelation_aggregates) {
 		// DuckDB's lateral UNNEST decorrelation groups generated delimiter keys before
 		// invoking the row-local table function; this is not a user-visible aggregate.
+		// The structural check also allows safe direct deltas for DuckLake change rows;
+		// user-authored GROUP BY aggregates do not match this plan shape.
 		facts.analysis.found_aggregation = false;
 		facts.analysis.found_nested_aggregate = false;
 		facts.analysis.aggregate_columns.clear();

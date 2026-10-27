@@ -1,0 +1,90 @@
+# name: test/sql/ducklake_lateral_unnest.test
+# description: DuckLake row-local UNNEST uses direct projection deltas
+# group: [sql]
+
+require openivm
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/ducklake_lateral_unnest.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE TABLE dl.lateral_src (id INTEGER, active BOOLEAN, vals VARCHAR[]);
+
+statement ok
+INSERT INTO dl.lateral_src VALUES
+    (1, true, ['same', 'same']),
+    (2, true, ['same']),
+    (3, false, ['hidden']),
+    (4, true, []::VARCHAR[]),
+    (7, true, ['stay', 'stay']);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.mv_lateral AS
+SELECT s.id, u.value
+FROM dl.lateral_src s
+CROSS JOIN UNNEST(s.vals) AS u(value)
+WHERE s.active;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name = 'mv_lateral';
+----
+2
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM dl.mv_lateral
+     EXCEPT ALL
+     SELECT s.id, u.value FROM dl.lateral_src s
+     CROSS JOIN UNNEST(s.vals) AS u(value) WHERE s.active)
+    UNION ALL
+    (SELECT s.id, u.value FROM dl.lateral_src s
+     CROSS JOIN UNNEST(s.vals) AS u(value) WHERE s.active
+     EXCEPT ALL
+     SELECT * FROM dl.mv_lateral)
+);
+----
+0
+
+statement ok
+INSERT INTO dl.lateral_src VALUES
+    (5, true, ['new', 'new']),
+    (6, false, ['ignored']);
+
+statement ok
+UPDATE dl.lateral_src SET vals = ['changed', 'changed'] WHERE id = 2;
+
+statement ok
+UPDATE dl.lateral_src SET active = true WHERE id = 3;
+
+statement ok
+DELETE FROM dl.lateral_src WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_lateral');
+
+query I
+SELECT COUNT(*) FROM (
+    (SELECT * FROM dl.mv_lateral
+     EXCEPT ALL
+     SELECT s.id, u.value FROM dl.lateral_src s
+     CROSS JOIN UNNEST(s.vals) AS u(value) WHERE s.active)
+    UNION ALL
+    (SELECT s.id, u.value FROM dl.lateral_src s
+     CROSS JOIN UNNEST(s.vals) AS u(value) WHERE s.active
+     EXCEPT ALL
+     SELECT * FROM dl.mv_lateral)
+);
+----
+0
+
+query I
+SELECT count(*) FROM dl.mv_lateral WHERE value IN ('stay', 'changed', 'new');
+----
+6
