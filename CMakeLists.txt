@@ -131,6 +131,16 @@ install(
   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
 
+# core_functions and parquet are defined after this directory is configured, so
+# register them at the end.
+function(openivm_link_extensions TARGET)
+  cmake_language(
+    EVAL
+    CODE
+    "cmake_language(DEFER DIRECTORY ${CMAKE_SOURCE_DIR} CALL duckdb_link_extensions ${TARGET} openivm core_functions parquet)"
+  )
+endfunction()
+
 # Integration tests run on all native platforms, including Windows.
 if(NOT EMSCRIPTEN)
   set(OPENIVM_LINK_LIBS
@@ -146,21 +156,20 @@ if(NOT EMSCRIPTEN)
                            test/integration/register_loadable_extensions.cpp)
   target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS}
                         duckdb_loadable_extensions)
-  duckdb_link_extensions(scheduler_catalog_test openivm core_functions parquet)
+  openivm_link_extensions(scheduler_catalog_test)
 
   add_executable(
     benchmark_metadata_test test/integration/benchmark_metadata_test.cpp
                             test/integration/register_loadable_extensions.cpp)
   target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS}
                         duckdb_loadable_extensions)
-  duckdb_link_extensions(benchmark_metadata_test openivm core_functions parquet)
+  openivm_link_extensions(benchmark_metadata_test)
   target_include_directories(benchmark_metadata_test PUBLIC benchmark/src)
 
   add_executable(source_delta_publication_test
                  test/integration/source_delta_publication_test.cpp)
   target_link_libraries(source_delta_publication_test ${OPENIVM_LINK_LIBS})
-  duckdb_link_extensions(source_delta_publication_test openivm core_functions
-                         parquet)
+  openivm_link_extensions(source_delta_publication_test)
   target_include_directories(
     source_delta_publication_test
     PUBLIC ${DUCKDB_MODULE_BASE_DIR}/extension/core_functions/include
@@ -172,7 +181,7 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
   # TPC-C data generation tool
   add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
   target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
-  duckdb_link_extensions(tpcc_setup openivm core_functions parquet)
+  openivm_link_extensions(tpcc_setup)
   target_include_directories(tpcc_setup PUBLIC benchmark)
 
   # Shared TPC-C helpers used by rewriter_benchmark, daemon_benchmark, and
@@ -196,7 +205,7 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
                        test/integration/register_loadable_extensions.cpp)
   target_link_libraries(rewriter_benchmark tpcc_helpers tpcdi_helpers
                         ${OPENIVM_LINK_LIBS} duckdb_loadable_extensions)
-  duckdb_link_extensions(rewriter_benchmark openivm core_functions parquet)
+  openivm_link_extensions(rewriter_benchmark)
   target_include_directories(rewriter_benchmark PUBLIC benchmark benchmark/src)
 
   # Refresh-daemon / cascade / pipeline benchmark
@@ -205,19 +214,19 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
                      test/integration/register_loadable_extensions.cpp)
   target_link_libraries(daemon_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS}
                         duckdb_loadable_extensions)
-  duckdb_link_extensions(daemon_benchmark openivm core_functions parquet)
+  openivm_link_extensions(daemon_benchmark)
   target_include_directories(daemon_benchmark PUBLIC benchmark benchmark/src)
 
   # Optimization-flag performance benchmark (Phase 2)
   add_executable(flag_benchmark benchmark/src/flag_benchmark.cpp)
   target_link_libraries(flag_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
-  duckdb_link_extensions(flag_benchmark openivm core_functions parquet)
+  openivm_link_extensions(flag_benchmark)
   target_include_directories(flag_benchmark PUBLIC benchmark benchmark/src)
 
   # Cost-model accuracy benchmark
   add_executable(cost_model_benchmark benchmark/src/cost_model_benchmark.cpp)
   target_link_libraries(cost_model_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
-  duckdb_link_extensions(cost_model_benchmark openivm core_functions parquet)
+  openivm_link_extensions(cost_model_benchmark)
   target_include_directories(cost_model_benchmark PUBLIC benchmark
                                                          benchmark/src)
 endif()

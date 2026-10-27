@@ -31,6 +31,7 @@
 #include "duckdb/storage/table/delete_state.hpp"
 #include "duckdb/transaction/duck_transaction.hpp"
 #include <algorithm>
+#include <tuple>
 #include <functional>
 #include <sstream>
 #include <map>
@@ -1733,6 +1734,11 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 			views.push_back(sv);
 		}
 	}
+	// UNION ALL does not preserve the metadata location order, so sort for deterministic scheduling.
+	std::sort(views.begin(), views.end(), [](const ScheduledView &a, const ScheduledView &b) {
+		return std::tie(a.metadata_catalog, a.metadata_schema, a.view_name) <
+		       std::tie(b.metadata_catalog, b.metadata_schema, b.view_name);
+	});
 	return views;
 }
 
