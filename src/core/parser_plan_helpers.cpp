@@ -713,6 +713,9 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 		    op->type == LogicalOperatorType::LOGICAL_ASOF_JOIN) {
 			facts.comparison_joins.push_back(&join);
 			for (auto &cond : join.conditions) {
+				if (!cond.IsComparison()) {
+					continue;
+				}
 				auto *left = cond.LeftReference().get();
 				auto *right = cond.RightReference().get();
 				if (left->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
@@ -733,6 +736,9 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 				}
 			}
 			for (auto &cond : join.conditions) {
+				if (!cond.IsComparison()) {
+					continue;
+				}
 				if (cond.LeftReference() &&
 				    cond.LeftReference()->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
 					facts.single_delim_key_bindings.insert(
@@ -1547,6 +1553,9 @@ static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
 			continue;
 		}
 		for (auto &cond : join->conditions) {
+			if (!cond.IsComparison()) {
+				continue;
+			}
 			auto *left = GetColumnRefThroughCasts(cond.LeftReference().get());
 			auto *right = GetColumnRefThroughCasts(cond.RightReference().get());
 			if (!left || !right) {
@@ -1829,7 +1838,8 @@ bool BuildProjectionKeyLineage(const CreateMVPlanFacts &facts, const vector<stri
 
 bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::LeftJoinKeySource &out) {
 	for (auto *join : facts.comparison_joins) {
-		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty()) {
+		if (!join || join->join_type != JoinType::LEFT || join->conditions.empty() ||
+		    !join->conditions[0].IsComparison()) {
 			continue;
 		}
 		auto *preserved_key = GetColumnRefThroughCasts(join->conditions[0].LeftReference().get());
@@ -2013,7 +2023,7 @@ static void CollectWindowJoinEdges(LogicalComparisonJoin &join, const CreateMVPl
 		    {std::move(lookup_ref), std::move(lookup_cast), std::move(changed_ref), std::move(changed_cast)});
 	};
 	for (auto &condition : join.conditions) {
-		if (condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+		if (!condition.IsComparison() || condition.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
 			continue;
 		}
 		string left_cast;
@@ -2397,7 +2407,7 @@ static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr, const 
 
 string ExtractFullOuterJoinMetadata(const CreateMVPlanFacts &facts) {
 	for (auto *join : facts.comparison_joins) {
-		if (join->join_type != JoinType::OUTER || join->conditions.empty()) {
+		if (join->join_type != JoinType::OUTER || join->conditions.empty() || !join->conditions[0].IsComparison()) {
 			continue;
 		}
 		auto &condition = join->conditions[0];
@@ -2625,6 +2635,9 @@ static std::set<idx_t> ComputeNullTablesForLevel(const CreateMVPlanFacts &facts,
 			}
 			bool touches_null = false;
 			for (auto &cond : other->conditions) {
+				if (!cond.IsComparison()) {
+					continue;
+				}
 				for (auto *side : {cond.LeftReference().get(), cond.RightReference().get()}) {
 					auto *cref = GetColumnRefThroughCasts(side);
 					if (!cref) {

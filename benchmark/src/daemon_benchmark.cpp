@@ -828,6 +828,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 
 	try {
 		ctx.db = std::make_shared<duckdb::DuckDB>(db_path);
+		openivm_bench::LoadCoreFunctions(*ctx.db);
 		duckdb::Connection con(*ctx.db);
 		MatQuery(con, "PRAGMA threads=4");
 		auto lr = MatQuery(con, "LOAD openivm");
@@ -1182,6 +1183,7 @@ int main(int argc, char **argv) {
 		if (setup_pid == 0) {
 			{
 				duckdb::DuckDB db(db_path);
+				openivm_bench::LoadCoreFunctions(db);
 				duckdb::Connection con(db);
 				CreateTPCCSchema(con);
 				InsertTPCCData(con, scale);

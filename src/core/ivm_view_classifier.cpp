@@ -178,6 +178,9 @@ static void AddJoinKeyGroupColumns(const CreateMVPlanFacts &facts, const vector<
 
 	unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
 	for (auto &cond : cjoin->conditions) {
+		if (!cond.IsComparison()) {
+			continue;
+		}
 		AddJoinKeyColumn(cond.LeftReference(), join_key_cols);
 		AddJoinKeyColumn(cond.RightReference(), join_key_cols);
 	}

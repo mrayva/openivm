@@ -270,7 +270,7 @@ static bool TryRewriteSemiAntiProbeKeyProjection(unique_ptr<LogicalOperator> &no
 			return false;
 		}
 		for (auto &condition : inner_join.conditions) {
-			if (!condition.LeftReference() || !condition.RightReference() ||
+			if (!condition.IsComparison() || !condition.LeftReference() || !condition.RightReference() ||
 			    !TryCollectSemiAntiKeyReplacement(condition.GetComparisonType(), condition.GetLHS(), condition.GetRHS(),
 			                                      source_bindings, delim_bindings, replacements)) {
 				return false;
@@ -1160,7 +1160,7 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
 	std::function<bool(LogicalOperator *)> find = [&](LogicalOperator *node) {
 		if (node->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
 			auto &join = node->Cast<LogicalComparisonJoin>();
-			if (IsOuterJoin(join.join_type) && !join.conditions.empty()) {
+			if (IsOuterJoin(join.join_type) && !join.conditions.empty() && join.conditions[0].IsComparison()) {
 				auto &condition = join.conditions[0];
 				bindings.found = true;
 				bindings.is_full_outer = join.join_type == JoinType::OUTER;

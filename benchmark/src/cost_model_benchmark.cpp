@@ -913,6 +913,7 @@ static PreparedCase PrepareCase(const string &src_db_path, const QueryDef &q, Wo
 		// Scoped so the database is closed, and therefore checkpointed, before anything copies the
 		// file. A snapshot taken while it is open could miss writes still sitting in the WAL.
 		duckdb::DuckDB db(prepared.state->path);
+		openivm_bench::LoadCoreFunctions(db);
 		duckdb::Connection con(db);
 		auto load = MatQuery(con, "LOAD openivm");
 		if (!load || load->HasError()) {
@@ -960,6 +961,7 @@ static bool ApplyCycleDelta(PreparedCase &prepared, const QueryDef &q, Workload 
                             string &error) {
 	try {
 		duckdb::DuckDB db(prepared.state->path);
+		openivm_bench::LoadCoreFunctions(db);
 		duckdb::Connection con(db);
 		auto load = MatQuery(con, "LOAD openivm");
 		if (!load || load->HasError()) {
@@ -1006,6 +1008,7 @@ static ModeResult RunMode(const PreparedCase &prepared, const QueryDef &q, Workl
 	}
 	try {
 		duckdb::DuckDB db(temp.path);
+		openivm_bench::LoadCoreFunctions(db);
 		duckdb::Connection con(db);
 		auto load = MatQuery(con, "LOAD openivm");
 		if (!load || load->HasError()) {
@@ -1221,6 +1224,7 @@ int main(int argc, char **argv) {
 	if (!FileExists(db_path)) {
 		Log("Creating TPC-C DB at scale " + to_string(scale) + ": " + db_path);
 		duckdb::DuckDB db(db_path);
+		openivm_bench::LoadCoreFunctions(db);
 		duckdb::Connection con(db);
 		CreateTPCCSchema(con);
 		InsertTPCCData(con, scale, openivm_bench::TPCCScaleProfile::SPEC);

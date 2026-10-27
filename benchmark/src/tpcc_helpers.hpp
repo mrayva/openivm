@@ -6,6 +6,8 @@
 
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
+#include "core_functions_extension.hpp"
+#include "parquet_extension.hpp"
 
 #include <string>
 #include <sys/stat.h>
@@ -45,5 +47,11 @@ void InsertTPCCData(duckdb::Connection &con, int scale_factor, TPCCScaleProfile 
 // INSERT, and DELETE across CUSTOMER / STOCK / ORDER_LINE / HISTORY /
 // NEW_ORDER / WAREHOUSE.
 std::vector<std::string> GenerateDeltaPool(int scale_factor);
+
+// SUM/AVG/etc. live in core_functions, which an embedded DuckDB does not register on its own.
+inline void LoadCoreFunctions(duckdb::DuckDB &db) {
+	db.LoadStaticExtension<duckdb::CoreFunctionsExtension>();
+	db.LoadStaticExtension<duckdb::ParquetExtension>();
+}
 
 } // namespace openivm_bench

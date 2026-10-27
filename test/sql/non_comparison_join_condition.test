@@ -1,0 +1,52 @@
+# name: test/sql/non_comparison_join_condition.test
+# description: Inner join whose ON clause mixes column comparisons with a non-left/right predicate (DuckDB 2.0 JoinCondition expression form)
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE cust (w INT, id INT, bal DOUBLE);
+
+statement ok
+INSERT INTO cust VALUES (1, 1, 10.0), (1, 2, 15.0), (1, 3, 100.0), (2, 1, 5.0), (2, 2, 7.0);
+
+statement ok
+CREATE MATERIALIZED VIEW cust_pairs AS SELECT c1.w, c1.id AS id1, c2.id AS id2 FROM cust c1 JOIN cust c2 ON c1.w = c2.w AND c1.id < c2.id AND ABS(c1.bal - c2.bal) < 10;
+
+query III rowsort
+SELECT * FROM cust_pairs;
+----
+1	1	2
+2	1	2
+
+# Conflicting DML batch before one refresh
+statement ok
+INSERT INTO cust VALUES (1, 4, 95.0), (2, 3, 6.0), (3, 1, 1.0), (3, 2, 2.0);
+
+statement ok
+DELETE FROM cust WHERE w = 1 AND id = 2;
+
+statement ok
+UPDATE cust SET bal = 12.0 WHERE w = 1 AND id = 3;
+
+statement ok
+INSERT INTO cust VALUES (1, 5, 11.0);
+
+statement ok
+DELETE FROM cust WHERE w = 3 AND id = 2;
+
+statement ok
+PRAGMA refresh('cust_pairs');
+
+query III
+(SELECT * FROM cust_pairs EXCEPT ALL SELECT c1.w, c1.id, c2.id FROM cust c1 JOIN cust c2 ON c1.w = c2.w AND c1.id < c2.id AND ABS(c1.bal - c2.bal) < 10)
+----
+
+query III
+(SELECT c1.w, c1.id, c2.id FROM cust c1 JOIN cust c2 ON c1.w = c2.w AND c1.id < c2.id AND ABS(c1.bal - c2.bal) < 10 EXCEPT ALL SELECT * FROM cust_pairs)
+----
+
+query I
+SELECT count(*) > 0 FROM cust_pairs;
+----
+true

@@ -455,6 +455,7 @@ static bool RunOneConfig(const QueryDef &q, Workload wl, int delta_size, bool al
 	const string &dl_path = tp.dl;
 
 	duckdb::DuckDB db(my_db);
+	openivm_bench::LoadCoreFunctions(db);
 	duckdb::Connection con(db);
 	auto load = MatQuery(con, "LOAD openivm");
 	if (!load || load->HasError()) {
@@ -898,6 +899,7 @@ int main(int argc, char **argv) {
 		if (pid == 0) {
 			{
 				duckdb::DuckDB db(db_path);
+				openivm_bench::LoadCoreFunctions(db);
 				duckdb::Connection con(db);
 				CreateTPCCSchema(con);
 				InsertTPCCData(con, scale);

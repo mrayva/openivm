@@ -171,7 +171,11 @@ if(NOT EMSCRIPTEN AND NOT WIN32)
   # flag_benchmark.
   add_library(tpcc_helpers STATIC benchmark/src/tpcc_helpers.cpp)
   target_link_libraries(tpcc_helpers ${OPENIVM_LINK_LIBS})
-  target_include_directories(tpcc_helpers PUBLIC benchmark/src)
+  target_include_directories(
+    tpcc_helpers
+    PUBLIC benchmark/src
+           ${DUCKDB_MODULE_BASE_DIR}/extension/core_functions/include
+           ${DUCKDB_MODULE_BASE_DIR}/extension/parquet/include)
 
   # TPC-DI schema + data helpers (used only by rewriter_benchmark).
   add_library(tpcdi_helpers STATIC benchmark/src/tpcdi_helpers.cpp)

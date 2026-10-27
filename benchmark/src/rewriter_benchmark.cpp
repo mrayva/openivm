@@ -536,6 +536,7 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
                             const string &workload) {
 	try {
 		duckdb::DuckDB db(db_path);
+		openivm_bench::LoadCoreFunctions(db);
 		db.LoadStaticExtension<duckdb::OpenivmExtension>();
 		duckdb::Connection con(db);
 		MatQuery(con, "PRAGMA threads=4");
@@ -1297,6 +1298,7 @@ static vector<string> RunBenchmark(const string &queries_dir, const string &db_p
 		if (setup_pid == 0) {
 			{
 				duckdb::DuckDB db(db_path);
+				openivm_bench::LoadCoreFunctions(db);
 				duckdb::Connection con(db);
 				if (workload == "tpcdi") {
 					openivm_bench::CreateTPCDISchema(con);

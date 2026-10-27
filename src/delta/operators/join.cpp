@@ -855,7 +855,8 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 			idx_t other_child = 1 - null_side_child;
 			LogicalOperator *current_null_side_node = j->children[null_side_child].get();
 			LogicalGet *current_null_side_get = FindGetInSubtree(current_null_side_node);
-			if (current_null_side_get && null_leaf_idx != SIZE_MAX && (leaf_has_delta_mask & (1ULL << null_leaf_idx))) {
+			if (current_null_side_get && null_leaf_idx != SIZE_MAX && j->conditions[0].IsComparison() &&
+			    (leaf_has_delta_mask & (1ULL << null_leaf_idx))) {
 				auto &cond = j->conditions[0];
 				// null_key_expr references the null-supplying side (used to size/position the Δ-scan probe
 				// we build below). other_key_expr references the OTHER (mask-driven, preserved) side -- the
