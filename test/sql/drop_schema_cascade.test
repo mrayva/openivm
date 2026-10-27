@@ -1,0 +1,77 @@
+# name: test/sql/drop_schema_cascade.test
+# description: DROP SCHEMA ... CASCADE removes the maintenance objects of every MV it owns, even with a custom internal schema
+# group: [sql]
+
+require openivm
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+SET openivm_internal_schema='Internal Space';
+
+statement ok
+CREATE SCHEMA "Drop;Space";
+
+statement ok
+CREATE SCHEMA "Keep.Space";
+
+statement ok
+CREATE TABLE "Drop;Space".items(i INTEGER);
+
+statement ok
+CREATE TABLE "Keep.Space".items(i INTEGER);
+
+statement ok
+INSERT INTO "Drop;Space".items VALUES (1),(1),(2);
+
+statement ok
+INSERT INTO "Keep.Space".items VALUES (3),(3),(4);
+
+statement ok
+CREATE MATERIALIZED VIEW "Drop;Space"."Same.MV" AS SELECT * FROM "Drop;Space".items;
+
+statement ok
+CREATE MATERIALIZED VIEW "Keep.Space"."Sibling" AS SELECT * FROM "Keep.Space".items;
+
+# Replacement inside an open transaction precedes the cascade.
+statement ok
+BEGIN;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW "Drop;Space"."Same.MV" AS SELECT * FROM "Drop;Space".items;
+
+statement ok
+DROP SCHEMA "Drop;Space" CASCADE;
+
+statement ok
+COMMIT;
+
+# Only the sibling's maintenance objects remain.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Internal Space' AND table_name LIKE '%64726f703b7370616365%';
+----
+0
+
+# The surviving MV still refreshes correctly after a batch of conflicting DML.
+statement ok
+INSERT INTO "Keep.Space".items VALUES (5),(5),(6);
+
+statement ok
+DELETE FROM "Keep.Space".items WHERE i = 3;
+
+statement ok
+UPDATE "Keep.Space".items SET i = 9 WHERE i = 4;
+
+statement ok
+PRAGMA refresh('"Keep.Space"."Sibling"');
+
+query I
+SELECT count(*) FROM (SELECT * FROM "Keep.Space"."Sibling" EXCEPT ALL SELECT * FROM "Keep.Space".items);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT * FROM "Keep.Space".items EXCEPT ALL SELECT * FROM "Keep.Space"."Sibling");
+----
+0

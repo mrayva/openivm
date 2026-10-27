@@ -157,6 +157,10 @@ if(NOT EMSCRIPTEN)
   target_link_libraries(source_delta_publication_test ${OPENIVM_LINK_LIBS})
   duckdb_link_extensions(source_delta_publication_test openivm core_functions
                          parquet)
+  target_include_directories(
+    source_delta_publication_test
+    PUBLIC ${DUCKDB_MODULE_BASE_DIR}/extension/core_functions/include
+           ${DUCKDB_MODULE_BASE_DIR}/extension/parquet/include)
 endif()
 
 # Benchmark tools are currently supported on Unix native platforms.

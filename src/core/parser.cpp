@@ -2601,9 +2601,19 @@ struct TrackedDropProgram {
 // TABLE CASCADE and SCHEMA CASCADE remove the same ownership closure. Build one
 // cleanup program before any physical drop, so shared source deltas are tested
 // against the complete set of removed consumers across metadata catalogs.
+// A schema DROP carries the path [catalog, schema], which QualifiedName::Catalog() does not report (it needs
+// [catalog, schema, name]); the catalog is its leading component. Other drops use Catalog() as usual.
+static string DropCatalogName(const DropInfo &drop_info) {
+	auto &path = drop_info.GetQualifiedName().Path();
+	if (drop_info.type == CatalogType::SCHEMA_ENTRY && path.size() >= 2) {
+		return path.front().GetIdentifierName();
+	}
+	return drop_info.GetQualifiedName().Catalog().GetIdentifierName();
+}
+
 static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info, bool defer_native_execution) {
 	// DuckLake maintains its own metadata catalog through internal DROPs; they are never tracked sources.
-	if (StringUtil::StartsWith(drop_info.GetQualifiedName().Catalog().GetIdentifierName(), "__ducklake_metadata_")) {
+	if (StringUtil::StartsWith(DropCatalogName(drop_info), "__ducklake_metadata_")) {
 		return (drop_info.type == CatalogType::SCHEMA_ENTRY ? BuildDropSchemaStatement(drop_info)
 		                                                    : BuildDropTableStatement(drop_info)) +
 		       ";\n";
@@ -2649,7 +2659,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		drop_info.SetCatalog(Identifier(table_entry->ParentCatalog().GetName()));
 		drop_info.SetSchema(Identifier(table_entry->ParentSchema().name));
 		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		if (drop_info.GetQualifiedName().Catalog().GetIdentifierName().empty()) {
+		if (DropCatalogName(drop_info).empty()) {
 			drop_info.SetCatalog(Identifier(default_entry.GetCatalog().GetIdentifierName().empty()
 			                                    ? DatabaseManager::GetDefaultDatabase(context).GetIdentifierName()
 			                                    : default_entry.GetCatalog().GetIdentifierName()));
@@ -2665,8 +2675,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		if (table_entry->temporary ||
 		    IncrementalTableNames::IsMaintenanceTable(drop_info.GetQualifiedName().Name().GetIdentifierName()) ||
 		    (table_entry->ParentCatalog().IsDuckCatalog() &&
-		     !RefreshMetadata::FindSourceDeltaForMutation(context,
-		                                                  drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
+		     !RefreshMetadata::FindSourceDeltaForMutation(context, DropCatalogName(drop_info),
 		                                                  drop_info.GetQualifiedName().Schema().GetIdentifierName(),
 		                                                  drop_info.GetQualifiedName().Name().GetIdentifierName()))) {
 			return drop_statement();
@@ -2676,7 +2685,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	Connection con(*context.db);
 	TransactionalMVLockState::Get(*con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-	RefreshMetadata::UseCatalog(context, con, drop_info.GetQualifiedName().Catalog().GetIdentifierName());
+	RefreshMetadata::UseCatalog(context, con, DropCatalogName(drop_info));
 	auto locations = RefreshMetadata::MetadataLocations(context, openivm::VIEWS_TABLE);
 	vector<TrackedDropView> roots;
 	vector<string> dependent_views;
@@ -2686,13 +2695,13 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		if (!schema_drop) {
 			LifecycleLeaseState::Get(context).Acquire(
 			    context, RefreshMetadata::CurrentLocation(con),
-			    {LifecycleLeaseState::SourceKey(drop_info.GetQualifiedName().Catalog().GetIdentifierName(),
+			    {LifecycleLeaseState::SourceKey(DropCatalogName(drop_info),
 			                                    drop_info.GetQualifiedName().Schema().GetIdentifierName(),
 			                                    drop_info.GetQualifiedName().Name().GetIdentifierName())});
 		}
 		if (schema_drop) {
 			auto namespace_matches = [&](const string &catalog_name, const string &schema_name) {
-				return StringUtil::CIEquals(catalog_name, drop_info.GetQualifiedName().Catalog().GetIdentifierName()) &&
+				return StringUtil::CIEquals(catalog_name, DropCatalogName(drop_info)) &&
 				       StringUtil::CIEquals(schema_name, drop_info.GetQualifiedName().Name().GetIdentifierName());
 			};
 			auto metadata_location = RefreshMetadata::CurrentLocation(con);
@@ -2723,7 +2732,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			}
 			continue;
 		}
-		const string drop_catalog = drop_info.GetQualifiedName().Catalog().GetIdentifierName();
+		const string drop_catalog = DropCatalogName(drop_info);
 		const string drop_schema = drop_info.GetQualifiedName().Schema().GetIdentifierName();
 		const string drop_name = drop_info.GetQualifiedName().Name().GetIdentifierName();
 		auto dependent_rows = MatQuery(
@@ -2751,8 +2760,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		}
 	}
 	for (auto &view : LeaseTrackedViewDropOrder(context, con, locations, roots)) {
-		program.Append(context, con, view, drop_info.GetQualifiedName().Catalog().GetIdentifierName(), true,
-		               OnEntryNotFound::RETURN_NULL);
+		program.Append(context, con, view, DropCatalogName(drop_info), true, OnEntryNotFound::RETURN_NULL);
 		TransactionalMVMetadataState::Get(context).RegisterViewDrop(view.second);
 		dependent_views.push_back(view.second);
 	}
@@ -2761,12 +2769,9 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	}
 	AppendUnusedSourceDropProgram(context, con, program.sources, program.sql, program.excluded_consumers);
 	for (auto &source : program.sources) {
-		program.staged |=
-		    !StringUtil::CIEquals(source.catalog_name, drop_info.GetQualifiedName().Catalog().GetIdentifierName());
+		program.staged |= !StringUtil::CIEquals(source.catalog_name, DropCatalogName(drop_info));
 	}
-	if (!schema_drop &&
-	    GetCatalogByName(context, drop_info.GetQualifiedName().Catalog().GetIdentifierName()).GetCatalogType() ==
-	        "ducklake") {
+	if (!schema_drop && GetCatalogByName(context, DropCatalogName(drop_info)).GetCatalogType() == "ducklake") {
 		drop_info.cascade = false;
 	}
 	program.sql += drop_statement();

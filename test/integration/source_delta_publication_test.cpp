@@ -1,4 +1,6 @@
 #include "duckdb.hpp"
+#include "core_functions_extension.hpp"
+#include "parquet_extension.hpp"
 #include "core/parser.hpp"
 #include "core/parser_create_mv_helpers.hpp"
 #include "core/parser_ddl.hpp"
@@ -86,7 +88,8 @@ static void TestInternalSchemaReopen(const string &path) {
 		DBConfig config;
 		config.options.load_extensions = false;
 		DuckDB db(path, &config);
-		ExtensionHelper::LoadExtension(db, "core_functions");
+		db.LoadStaticExtension<CoreFunctionsExtension>();
+		db.LoadStaticExtension<ParquetExtension>();
 		ExtensionHelper::LoadExtension(db, "openivm");
 		Connection owner(db);
 		Execute(owner, "SET openivm_disable_daemon=true; PRAGMA disable_checkpoint_on_shutdown; "
@@ -97,6 +100,8 @@ static void TestInternalSchemaReopen(const string &path) {
 	}
 	{
 		DuckDB db(path);
+		db.LoadStaticExtension<CoreFunctionsExtension>();
+		db.LoadStaticExtension<ParquetExtension>();
 		Connection owner(db);
 		Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true;");
 		Execute(owner, "SELECT CASE WHEN current_setting('openivm_internal_schema')='' "
@@ -147,6 +152,8 @@ static void TestInternalSchemaReopen(const string &path) {
 static void TestPublication(bool explicit_transaction) {
 	std::cerr << "CASE publication explicit_transaction=" << explicit_transaction << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection first(db), second(db), observer(db);
 	Execute(first, "LOAD openivm; SET openivm_disable_daemon=true; "
 	               "SET openivm_internal_schema='Internal Space'; "
@@ -221,6 +228,8 @@ static void TestDMLDuringPublication(bool dedicated_schema, const string &first_
 	          << " first_operation=" << first_operation << " explicit_transaction=" << explicit_transaction
 	          << " commit=" << commit << " publish=" << publish << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection creator(db), writer(db), observer(db);
 	const string source = "\"Source.Space\".\"Items;Table\"";
 	const string view = "\"Source.Space\".\"MV;View\"";
@@ -306,6 +315,8 @@ static void TestDropDuringPublication(bool explicit_transaction, bool staged_dro
 	std::cerr << "CASE drop during publication explicit_transaction=" << explicit_transaction
 	          << " staged_drop=" << staged_drop << " schema_drop=" << schema_drop << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection creator(db), dropper(db), observer(db);
 	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; "
 	                 "SET openivm_internal_schema='Internal Space'; "
@@ -382,6 +393,8 @@ static void TestSharedMetadataUpgrade(bool explicit_transaction, bool commit) {
 	std::cerr << "CASE shared metadata upgrade explicit_transaction=" << explicit_transaction << " commit=" << commit
 	          << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
 	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
@@ -422,6 +435,8 @@ static void TestCrossCatalogSharedDelta(bool dedicated_schema, bool commit) {
 	std::cerr << "CASE cross-catalog shared delta dedicated_schema=" << dedicated_schema << " commit=" << commit
 	          << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
 	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema=" +
@@ -485,6 +500,8 @@ static void TestCrossCatalogPublicationConsumers(bool commit, const string &inte
 	std::cerr << "CASE cross-catalog publication consumers replacement_commit=" << commit
 	          << " internal_schema=" << internal_schema << " unqualified_parent=" << unqualified_parent << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	const string source = "memory.\"Source.Space\".items";
 	const string replacement = "memory.\"Other.Source\".items";
@@ -548,6 +565,8 @@ static void TestSchemaCascade(bool explicit_transaction, bool commit, bool cross
 	std::cerr << "CASE schema cascade explicit_transaction=" << explicit_transaction << " commit=" << commit
 	          << " cross_catalog=" << cross_catalog << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db), helper(db);
 	const string dropped_schema = "memory.\"Drop;Space\"";
 	const string own_source = dropped_schema + ".items";
@@ -738,6 +757,8 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	std::cerr << "CASE mixed lifecycle explicit_transaction=" << explicit_transaction << " commit=" << commit
 	          << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
 	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal;Space'; "
@@ -789,6 +810,8 @@ static void TestCreateAlterTransaction(bool existing_metadata, bool batched, boo
 	std::cerr << "CASE CREATE/ALTER existing_metadata=" << existing_metadata << " batched=" << batched
 	          << " commit=" << commit << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
 	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
@@ -859,6 +882,8 @@ static void TestCreateAlterTransaction(bool existing_metadata, bool batched, boo
 static void TestMetadataSchemaMigration(bool create_trigger) {
 	std::cerr << "CASE metadata migration create_trigger=" << create_trigger << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
 	               "SET openivm_internal_schema='Internal Space'; CREATE SCHEMA \"Source.Space\"; "
@@ -949,6 +974,8 @@ static void TestMetadataSchemaSettingTransaction(bool existing_metadata, bool ba
 	std::cerr << "CASE metadata setting transaction existing_metadata=" << existing_metadata << " batched=" << batched
 	          << " commit=" << commit << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
 	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
@@ -1052,6 +1079,8 @@ static void TestFailedCreateSourceDelta(bool dedicated_schema, bool peer_view, b
 	std::cerr << "CASE failed CREATE dedicated_schema=" << dedicated_schema << " peer_view=" << peer_view
 	          << " shared=" << shared << std::endl;
 	DuckDB db(nullptr);
+	db.LoadStaticExtension<CoreFunctionsExtension>();
+	db.LoadStaticExtension<ParquetExtension>();
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
 	               "SET openivm_metadata_schema='Control.Space'; CREATE TABLE source(i INTEGER); "
