@@ -1,0 +1,81 @@
+# name: test/sql/prepared_dml.test
+# description: Prepared INSERT/UPDATE/DELETE on a tracked source are captured into the delta table
+# group: [sql]
+
+require openivm
+
+statement ok
+CREATE TABLE ps (id INT, grp VARCHAR, v INT);
+
+statement ok
+INSERT INTO ps SELECT i, 'g' || (i % 3)::VARCHAR, i FROM range(0, 12) t(i);
+
+statement ok
+CREATE MATERIALIZED VIEW ps_totals AS SELECT grp, SUM(v) AS total, COUNT(*) AS cnt FROM ps GROUP BY grp;
+
+statement ok
+PREPARE ps_ins AS INSERT INTO ps VALUES ($1, $2, $3);
+
+statement ok
+PREPARE ps_del AS DELETE FROM ps WHERE id = $1;
+
+statement ok
+PREPARE ps_del_const AS DELETE FROM ps WHERE id = 3;
+
+statement ok
+PREPARE ps_bump AS UPDATE ps SET v = v + $1 WHERE grp = 'g1';
+
+# Conflicting prepared DML on the same rows before a single refresh
+statement ok
+EXECUTE ps_ins(100, 'g2', 5);
+
+statement ok
+EXECUTE ps_bump(1);
+
+statement ok
+EXECUTE ps_del_const;
+
+statement ok
+EXECUTE ps_bump(10);
+
+statement ok
+EXECUTE ps_del(100);
+
+statement ok
+EXECUTE ps_ins(101, 'g0', 7);
+
+statement ok
+EXECUTE ps_del(4);
+
+statement ok
+PRAGMA refresh('ps_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM ps_totals EXCEPT ALL SELECT grp, SUM(v), COUNT(*) FROM ps GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, SUM(v), COUNT(*) FROM ps GROUP BY grp EXCEPT ALL SELECT * FROM ps_totals);
+----
+0
+
+# A second round reuses the same prepared statements
+statement ok
+EXECUTE ps_bump(100);
+
+statement ok
+EXECUTE ps_del(7);
+
+statement ok
+PRAGMA refresh('ps_totals');
+
+query I
+SELECT count(*) FROM (SELECT * FROM ps_totals EXCEPT ALL SELECT grp, SUM(v), COUNT(*) FROM ps GROUP BY grp);
+----
+0
+
+query I
+SELECT count(*) FROM (SELECT grp, SUM(v), COUNT(*) FROM ps GROUP BY grp EXCEPT ALL SELECT * FROM ps_totals);
+----
+0

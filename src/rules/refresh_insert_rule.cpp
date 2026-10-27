@@ -491,13 +491,17 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		return;
 	}
 
-	// SQL EXECUTE runs a cached plan that this rule does not see again; gate it as below.
+	// SQL EXECUTE of a cached plan is not seen again by this rule; gate it as below. A prepared statement that
+	// requires a rebind arrives as the EXECUTE's child plan instead, and is rewritten like any other DML.
 	if (root->type == LogicalOperatorType::LOGICAL_EXECUTE) {
 		auto &prepared = root->Cast<LogicalExecute>().prepared;
 		if (prepared && prepared->physical_plan) {
 			AdmitPlanMutations(input.context, prepared->physical_plan->Root());
 		}
-		return;
+		if (root->children.empty()) {
+			return;
+		}
+		OPENIVM_DEBUG_PRINT("[INSERT RULE] rewriting rebound prepared plan under EXECUTE\n");
 	}
 
 	if (plan->children.empty()) {

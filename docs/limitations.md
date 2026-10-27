@@ -104,14 +104,6 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
   blocked with an error. Renaming a referenced column rewrites stored MV SQL and refresh
   metadata, including supported aux-state and lineage metadata.
 
-- **Prepared DML on tracked sources (DuckDB 2.0).** DuckDB 2.0 removed the
-  `OnExecutePrepared` hook that OpenIVM used to re-plan a cached `PREPARE`d
-  `INSERT`/`UPDATE`/`DELETE` through the delta-capture rewrite. A statement prepared and
-  then `EXECUTE`d against a tracked source is therefore not captured into its delta table,
-  and views over that source miss the change. Run such DML as a plain statement (or
-  re-`PREPARE` is not enough); `test/sql/concurrent_checkpoint_gate.test` exercises this
-  path and currently fails on its prepared `UPDATE`.
-
 - **Concurrency.** Tracked source writes, refreshes, and MV lifecycle operations in one
   database are serialized by a single mutation gate, so unrelated OpenIVM writes also
   wait for each other; see [Concurrency](internals/concurrency.md).
