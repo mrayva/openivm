@@ -38,7 +38,7 @@ PRAGMA refresh('mv_with_a_deliberately_long_name_that_exceeds_the_reference_file
 # Every reference file name is bounded even though the hex-encoded view names are far longer.
 query I
 SELECT count(*) FROM glob('__TEST_DIR__/openivm_*_queries_*.sql')
-WHERE length(regexp_extract(file, '[^/\\]+$')) > 110;
+WHERE length(parse_filename(file, false, 'system')) > 110;
 ----
 0
 
