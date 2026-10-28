@@ -206,6 +206,30 @@ static idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &bindi
 	                        binding.ToString().c_str(), op.GetName().c_str());
 }
 
+// Entries of the parent's projection map (or a filter's) index into this subtree's output; after the subtree gains a
+// column at insertion_idx, every entry at or past it must move up by one.
+static void ShiftParentProjectionIndexes(const vector<LogicalOperator *> &ancestors, const vector<size_t> &leaf_path,
+                                         size_t depth, idx_t insertion_idx) {
+	if (depth == 0) {
+		return;
+	}
+	auto *parent = ancestors[depth - 1];
+	vector<ProjectionIndex> *parent_map = nullptr;
+	if (auto *parent_join = dynamic_cast<LogicalJoin *>(parent)) {
+		parent_map = leaf_path[depth - 1] == 0 ? &parent_join->left_projection_map : &parent_join->right_projection_map;
+	} else if (parent->type == LogicalOperatorType::LOGICAL_FILTER) {
+		parent_map = &parent->Cast<LogicalFilter>().projection_map;
+	}
+	if (!parent_map) {
+		return;
+	}
+	for (auto &parent_idx : *parent_map) {
+		if (parent_idx.GetIndexUnsafe() >= insertion_idx) {
+			parent_idx = ProjectionIndex(parent_idx.GetIndexUnsafe() + 1);
+		}
+	}
+}
+
 static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator> &term,
                                                       const vector<size_t> &leaf_path, ColumnBinding mul_binding) {
 	vector<LogicalOperator *> ancestors;
@@ -246,9 +270,25 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 		}
 		if (auto *join = dynamic_cast<LogicalJoin *>(parent)) {
 			auto &projection_map = child_side == 0 ? join->left_projection_map : join->right_projection_map;
-			if (!projection_map.empty() &&
-			    std::find(projection_map.begin(), projection_map.end(), mul_idx) == projection_map.end()) {
+			// Compare by column identity: a raw index in the map can alias an unrelated column at the same position.
+			auto exposed = join->GetColumnBindings();
+			if (!projection_map.empty() && std::find(exposed.begin(), exposed.end(), mul_binding) == exposed.end()) {
+				// The new entry widens this join's output; indexes the parent holds past the insertion point move up.
+				idx_t insertion_idx = projection_map.size();
+				if (child_side == 1) {
+					insertion_idx += join->left_projection_map.empty() ? join->children[0]->GetColumnBindings().size()
+					                                                   : join->left_projection_map.size();
+				}
 				projection_map.push_back(ProjectionIndex(mul_idx));
+				ShiftParentProjectionIndexes(ancestors, leaf_path, depth, insertion_idx);
+			} else if (projection_map.empty()) {
+				// A pass-through join exposes the multiplicity in place, which moves every later output column.
+				idx_t insertion_idx = mul_idx;
+				if (child_side == 1) {
+					insertion_idx += join->left_projection_map.empty() ? join->children[0]->GetColumnBindings().size()
+					                                                   : join->left_projection_map.size();
+				}
+				ShiftParentProjectionIndexes(ancestors, leaf_path, depth, insertion_idx);
 			}
 			continue;
 		}

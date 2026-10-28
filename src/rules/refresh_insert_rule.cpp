@@ -543,7 +543,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		case LogicalOperatorType::LOGICAL_DELETE: {
 			auto &delete_op = dml->Cast<LogicalDelete>();
 			const auto &table_name = delete_op.table.name;
-			D_ASSERT(delete_op.expressions.size() == 1);
+			// expressions[0] is the row id; DuckDB appends index columns after it for tables with indexes/FKs.
+			D_ASSERT(!delete_op.expressions.empty());
 			auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
 			auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
 			    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
