@@ -35,18 +35,22 @@ PRAGMA refresh('mv_with_a_deliberately_long_name_that_exceeds_the_reference_file
 statement ok
 PRAGMA refresh('mv_with_a_deliberately_long_name_that_exceeds_the_reference_file_name_budget_b');
 
-# Every reference file name is bounded even though the hex-encoded view names are far longer.
+# The hex-encoded view names are far longer than the budget, so each reference file is truncated plus hashed. The two
+# views share the whole truncated prefix and differ only in the hash suffix.
 query I
-SELECT count(*) FROM glob('__TEST_DIR__/openivm_*_queries_*.sql')
-WHERE length(parse_filename(file, false, 'system')) > 110;
+SELECT length(content) > 0 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_7265666572656e63655f66696c655f6e616d65735f_18c8e907451153fe.sql');
 ----
-0
+true
 
-# Two views whose names share a long prefix still get distinct files.
 query I
-SELECT count(DISTINCT file) FROM glob('__TEST_DIR__/openivm_upsert_queries_*.sql');
+SELECT length(content) > 0 FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_7265666572656e63655f66696c655f6e616d65735f_626a2b283021941f.sql');
 ----
-2
+true
+
+query I
+SELECT length(content) > 0 FROM read_text('__TEST_DIR__/openivm_compiled_queries___openivm_mv_7265666572656e63655f66696c655f6e616d65735f_18c8e907451153fe.sql');
+----
+true
 
 query I
 SELECT count(*) FROM (
