@@ -122,7 +122,11 @@ class TransactionalDeltaAppendState {
 public:
 	TransactionalDeltaAppendState(ClientContext &context, const vector<unique_ptr<Expression>> &generated_expressions,
 	                              const vector<LogicalType> &delta_types)
-	    : generated_executor(context, generated_expressions) {
+	    : generated_executor(context) {
+		// ExpressionExecutor asserts on an empty expression list
+		for (auto &expression : generated_expressions) {
+			generated_executor.AddExpression(*expression);
+		}
 		vector<LogicalType> generated_types;
 		generated_types.reserve(generated_expressions.size());
 		for (auto &expression : generated_expressions) {
@@ -394,8 +398,12 @@ public:
 	                                    const vector<unique_ptr<Expression>> &generated_expressions,
 	                                    const vector<LogicalType> &delta_types, const vector<LogicalType> &base_types,
 	                                    const vector<LogicalType> &input_types, bool capture_existing_rows)
-	    : append_state(context.client, generated_expressions, delta_types),
-	      update_executor(context.client, update_expressions), selection(STANDARD_VECTOR_SIZE) {
+	    : append_state(context.client, generated_expressions, delta_types), update_executor(context.client),
+	      selection(STANDARD_VECTOR_SIZE) {
+		// ExpressionExecutor asserts on an empty expression list
+		for (auto &expression : update_expressions) {
+			update_executor.AddExpression(*expression);
+		}
 		vector<LogicalType> update_types;
 		update_types.reserve(update_expressions.size());
 		for (auto &expression : update_expressions) {

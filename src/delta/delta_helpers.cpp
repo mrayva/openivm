@@ -173,6 +173,8 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	OPENIVM_DEBUG_PRINT("[DuckLake] Snapshot range: %ld -> %ld\n", (long)start_snap, (long)cur_snap);
 
 	if (start_snap > cur_snap) {
+		// A copied plan's LogicalGet has no types until resolved; without them the empty result loses its columns.
+		old_get->ResolveOperatorTypes();
 		vector<LogicalType> empty_types = old_get->types;
 		empty_types.push_back(LogicalType::INTEGER);
 		vector<ColumnBinding> bindings;

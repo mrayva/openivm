@@ -906,7 +906,8 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			                   ExpressionFilter::CreateComparisonFilter(ExpressionType::COMPARE_EQUAL,
 			                                                            Value(StringUtil::Lower(schema))));
 		}
-		storage.InitializeScan(context, transaction, scan, columns, &filters);
+		// An empty filter set trips a DuckDB assertion; pass none for a full scan.
+		storage.InitializeScan(context, transaction, scan, columns, filters.HasFilters() ? &filters : nullptr);
 		DataChunk rows;
 		rows.Initialize(Allocator::Get(context), types);
 		while (true) {

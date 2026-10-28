@@ -14,7 +14,7 @@ static void ValidateCompileNode(const DeltaModelNode &node, LogicalOperator *op)
 	if (node.kind == DeltaModelNodeKind::SCAN) {
 		auto *get = dynamic_cast<LogicalGet *>(op);
 		if (get && node.source_table_index != DConstants::INVALID_INDEX) {
-			D_ASSERT(get->table_index == node.source_table_index);
+			D_ASSERT(get->table_index.index == node.source_table_index);
 		}
 	}
 	OPENIVM_DEBUG_PRINT("[IR Rewrite] node=%llu kind=%s rule=%s maintenance=%s/%s sources=%zu outputs=%zu hidden=%zu "
