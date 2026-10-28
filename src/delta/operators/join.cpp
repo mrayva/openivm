@@ -2027,9 +2027,27 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	delta.op->ResolveOperatorTypes();
 	auto delta_bindings = delta.op->GetColumnBindings();
 	auto delta_types = delta.op->types;
-	D_ASSERT(delta_bindings.size() == current_bindings.size() + 1);
 	delta_bindings.pop_back();
 	delta_types.pop_back();
+	// A delta scan exposes every scanned column at its column_ids position (CompactDeltaNode relies on that), while the
+	// current-state scan drops columns read only for pushed-down filters. Select the delta columns it still outputs.
+	if (delta_bindings.size() != current_bindings.size() &&
+	    current_projection->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &current_get = current_projection->children[0]->Cast<LogicalGet>();
+		vector<ColumnBinding> selected_bindings;
+		vector<LogicalType> selected_types;
+		for (auto &projection_id : current_get.projection_ids) {
+			if (projection_id.GetIndexUnsafe() >= delta_bindings.size()) {
+				throw InternalException("DeltaJoin: projected column %llu is outside the %llu-column delta scan",
+				                        projection_id.GetIndexUnsafe(), delta_bindings.size());
+			}
+			selected_bindings.push_back(delta_bindings[projection_id.GetIndexUnsafe()]);
+			selected_types.push_back(delta_types[projection_id.GetIndexUnsafe()]);
+		}
+		delta_bindings = std::move(selected_bindings);
+		delta_types = std::move(selected_types);
+	}
+	D_ASSERT(delta_bindings.size() == current_bindings.size());
 	vector<unique_ptr<Expression>> delta_exprs;
 	idx_t delta_idx = 0;
 	for (auto &delta_binding : delta_bindings) {
