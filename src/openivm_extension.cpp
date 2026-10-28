@@ -486,9 +486,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    vector<string> rows;
 		    const vector<pair<string, string>> files = {
 		        {"system", "openivm_system_tables.sql"},
-		        {"create", "openivm_compiled_queries_" + view_name + ".sql"},
-		        {"refresh", "openivm_upsert_queries_" + view_name + ".sql"},
-		        {"explain", "openivm_initial_load_explain_" + view_name + ".txt"}};
+		        {"create", SqlUtils::ReferenceFileName("openivm_compiled_queries_", view_name, ".sql")},
+		        {"refresh", SqlUtils::ReferenceFileName("openivm_upsert_queries_", view_name, ".sql")},
+		        {"explain", SqlUtils::ReferenceFileName("openivm_initial_load_explain_", view_name, ".txt")}};
 		    for (const auto &file : files) {
 			    string path;
 			    bool exists = false;

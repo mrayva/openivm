@@ -1890,7 +1890,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	Value files_path_val;
 	if (write_query_file && context.TryGetCurrentSetting("openivm_files_path", files_path_val) &&
 	    !files_path_val.IsNull()) {
-		string refresh_file_path = files_path_val.ToString() + "/openivm_upsert_queries_" + view_name + ".sql";
+		string refresh_file_path =
+		    files_path_val.ToString() + "/" + SqlUtils::ReferenceFileName("openivm_upsert_queries_", view_name, ".sql");
 		duckdb::SqlUtils::WriteFile(refresh_file_path, false, clean_query);
 	}
 

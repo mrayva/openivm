@@ -24,6 +24,10 @@ public:
 	static void RewriteSourceReferences(SQLStatement &statement,
 	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
+	//! Name of a per-view reference file. View names are hex-encoded and can be long enough to push the full path past
+	//! the Windows 260-character limit, so names beyond MAX_REFERENCE_VIEW_NAME_LENGTH are truncated and suffixed with
+	//! a hash of the full name to stay unique.
+	static string ReferenceFileName(const string &prefix, const string &view_name, const string &extension);
 	static string ExtractTableName(const string &sql);
 	static string EscapeSingleQuotes(const string &input);
 	static void ReplaceMaterializedView(string &query);

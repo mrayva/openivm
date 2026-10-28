@@ -1,0 +1,65 @@
+# name: test/sql/reference_file_names.test
+# description: Per-view reference SQL files stay within a bounded name length and remain unique for long view names
+# group: [sql]
+
+require openivm
+
+load __TEST_DIR__/reference_file_names_test.db
+
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+SET openivm_disable_daemon=true;
+
+statement ok
+CREATE TABLE src(k INTEGER, v INTEGER);
+
+statement ok
+INSERT INTO src VALUES (1, 10), (2, 20);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_with_a_deliberately_long_name_that_exceeds_the_reference_file_name_budget_a AS
+SELECT k, SUM(v) AS s FROM src GROUP BY k;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_with_a_deliberately_long_name_that_exceeds_the_reference_file_name_budget_b AS
+SELECT k, SUM(v) AS s FROM src GROUP BY k;
+
+statement ok
+INSERT INTO src VALUES (1, 5), (3, 30);
+
+statement ok
+PRAGMA refresh('mv_with_a_deliberately_long_name_that_exceeds_the_reference_file_name_budget_a');
+
+statement ok
+PRAGMA refresh('mv_with_a_deliberately_long_name_that_exceeds_the_reference_file_name_budget_b');
+
+# Every reference file name is bounded even though the hex-encoded view names are far longer.
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/openivm_*_queries_*.sql')
+WHERE length(regexp_extract(file, '[^/\\]+$')) > 110;
+----
+0
+
+# Two views whose names share a long prefix still get distinct files.
+query I
+SELECT count(DISTINCT file) FROM glob('__TEST_DIR__/openivm_upsert_queries_*.sql');
+----
+2
+
+query I
+SELECT count(*) FROM (
+    SELECT * FROM mv_with_a_deliberately_long_name_that_exceeds_the_reference_file_name_budget_a
+    EXCEPT ALL SELECT k, SUM(v) FROM src GROUP BY k
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, SUM(v) FROM src GROUP BY k
+    EXCEPT ALL SELECT * FROM mv_with_a_deliberately_long_name_that_exceeds_the_reference_file_name_budget_a
+);
+----
+0

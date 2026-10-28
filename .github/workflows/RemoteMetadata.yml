@@ -45,5 +45,26 @@ jobs:
       - name: Build
         run: make release
 
+      # The test installs postgres, ducklake and sqlite from the DuckDB extension repository. A new DuckDB release
+      # has no published builds until the extensions are rebuilt against it, so skip rather than fail until then.
+      - name: Check extension builds are published
+        id: extensions
+        run: |
+          source_id=$(./build/release/duckdb -csv -noheader -c "SELECT source_id FROM pragma_version()")
+          missing=""
+          for extension in postgres_scanner ducklake sqlite_scanner; do
+            url="http://extensions.duckdb.org/${source_id}/linux_amd64/${extension}.duckdb_extension.gz"
+            if ! curl -fsI "$url" > /dev/null; then
+              missing="$missing $extension"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::Skipping remote metadata test: no build for DuckDB ${source_id} of:${missing}"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Remote metadata integration test
+        if: steps.extensions.outputs.available == 'true'
         run: python3 test/integration/test_remote_metadata.py ./build/release/duckdb --require

@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/common/types/hash.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
@@ -550,6 +551,22 @@ static idx_t CopyBlockComment(const string &sql, idx_t start, string &out) {
 	}
 	out += sql.substr(start);
 	return sql.size();
+}
+
+string SqlUtils::ReferenceFileName(const string &prefix, const string &view_name, const string &extension) {
+	static constexpr idx_t MAX_REFERENCE_VIEW_NAME_LENGTH = 72;
+	static constexpr idx_t HASH_SUFFIX_LENGTH = 16;
+	if (view_name.size() <= MAX_REFERENCE_VIEW_NAME_LENGTH) {
+		return prefix + view_name + extension;
+	}
+	static const char *HEX_DIGITS = "0123456789abcdef";
+	auto hash = Hash(view_name.c_str(), view_name.size());
+	string suffix;
+	for (idx_t i = 0; i < HASH_SUFFIX_LENGTH; i++) {
+		suffix += HEX_DIGITS[(hash >> (4 * i)) & 0xF];
+	}
+	return prefix + view_name.substr(0, MAX_REFERENCE_VIEW_NAME_LENGTH - HASH_SUFFIX_LENGTH - 1) + "_" + suffix +
+	       extension;
 }
 
 void SqlUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {

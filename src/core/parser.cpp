@@ -1789,7 +1789,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 		Value files_path_val;
 		if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
-			SqlUtils::WriteFile(files_path_val.ToString() + "/openivm_initial_load_explain_" + view_name + ".txt",
+			SqlUtils::WriteFile(files_path_val.ToString() + "/" +
+			                        SqlUtils::ReferenceFileName("openivm_initial_load_explain_", view_name, ".txt"),
 			                    false, diagnostic);
 		}
 		if (SqlUtils::GetBoolSetting(context, "openivm_explain_initial_load_only", false)) {
@@ -2221,7 +2222,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
 		string base_path = files_path_val.ToString();
 		SqlUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
-		SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
+		SqlUtils::WriteFile(base_path + "/" +
+		                        SqlUtils::ReferenceFileName("openivm_compiled_queries_", view_name, ".sql"),
+		                    false, compiled_sql);
 	}
 
 	if (archive_enabled) {
